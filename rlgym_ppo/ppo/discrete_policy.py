@@ -6,19 +6,22 @@ Description:
     An implementation of a feed-forward neural network which parametrizes a discrete distribution over a space of actions.
 """
 
-
-from torch.distributions import Categorical
-import torch.nn as nn
-import torch
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+
+from rlgym_ppo.api import PPOPolicy
 
 
-class DiscreteFF(nn.Module):
+class DiscreteFF(PPOPolicy):
     def __init__(self, input_shape, n_actions, layer_sizes, device):
         super().__init__()
         self.device = device
 
-        assert len(layer_sizes) != 0, "AT LEAST ONE LAYER MUST BE SPECIFIED TO BUILD THE NEURAL NETWORK!"
+        assert (
+            len(layer_sizes) != 0
+        ), "AT LEAST ONE LAYER MUST BE SPECIFIED TO BUILD THE NEURAL NETWORK!"
         layers = [nn.Linear(input_shape, layer_sizes[0]), nn.ReLU()]
         prev_size = layer_sizes[0]
         for size in layer_sizes[1:]:

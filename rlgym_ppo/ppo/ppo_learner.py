@@ -1,21 +1,21 @@
 import os
 import time
+from typing import Callable, Generic
 
 import numpy as np
 import torch
+from rlgym.api import ActionSpaceType, ActionType, AgentID, ObsSpaceType, ObsType
+from torch import nn as nn
 
-from rlgym_ppo.ppo import ContinuousPolicy, DiscreteFF, MultiDiscreteFF, ValueEstimator
+from rlgym_ppo.api import PPOPolicy, ValueNet
+from rlgym_ppo.ppo import ExperienceBuffer
 
 
-class PPOLearner(object):
+class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpaceType]):
     def __init__(
         self,
-        obs_space_size,
-        act_space_size,
-        policy_type,
-        policy_layer_sizes,
-        critic_layer_sizes,
-        continuous_var_range,
+        policy: PPOPolicy[AgentID, ObsType, ActionType],
+        value_net: ValueNet[ObsType],
         batch_size,
         n_epochs,
         policy_lr,
@@ -30,27 +30,8 @@ class PPOLearner(object):
         assert (
             batch_size % mini_batch_size == 0
         ), "MINIBATCH SIZE MUST BE AN INTEGER MULTIPLE OF BATCH SIZE"
-
-        if policy_type == 2:
-            self.policy = ContinuousPolicy(
-                obs_space_size,
-                act_space_size * 2,
-                policy_layer_sizes,
-                device,
-                var_min=continuous_var_range[0],
-                var_max=continuous_var_range[1],
-            ).to(device)
-        elif policy_type == 1:
-            self.policy = MultiDiscreteFF(
-                obs_space_size, policy_layer_sizes, device
-            ).to(device)
-        else:
-            self.policy = DiscreteFF(
-                obs_space_size, act_space_size, policy_layer_sizes, device
-            ).to(device)
-        self.value_net = ValueEstimator(obs_space_size, critic_layer_sizes, device).to(
-            device
-        )
+        self.policy = policy
+        self.value_net = value_net
         self.mini_batch_size = mini_batch_size
 
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=policy_lr)
@@ -79,7 +60,7 @@ class PPOLearner(object):
         print(f"{'Critic':<10} {critic_params_count:<10}")
         print("-" * 20)
         print(f"{'Total':<10} {total_parameters:<10}")
-        
+
         print(f"Current Policy Learning Rate: {policy_lr}")
         print(f"Current Critic Learning Rate: {critic_lr}")
 
@@ -89,7 +70,7 @@ class PPOLearner(object):
         self.ent_coef = ent_coef
         self.cumulative_model_updates = 0
 
-    def learn(self, exp):
+    def learn(self, exp: ExperienceBuffer):
         """
         Compute PPO updates with an experience buffer.
 
@@ -124,10 +105,11 @@ class PPOLearner(object):
                     batch_acts,
                     batch_old_probs,
                     batch_obs,
-                    batch_target_values,
+                    batch_values,
                     batch_advantages,
                 ) = batch
                 batch_acts = batch_acts.view(self.batch_size, -1)
+                batch_target_values = batch_values + batch_advantages
                 self.policy_optimizer.zero_grad()
                 self.value_optimizer.zero_grad()
 

@@ -7,9 +7,14 @@ Description:
 
 """
 
+from typing import List
 
-import torch.nn as nn
 import torch
+import torch.nn as nn
+from rlgym.api import ActionType, ObsType, RewardType
+
+from rlgym_ppo.api import ActionType, AgentID, ObsType, RewardType, RewardTypeWrapper
+from rlgym_ppo.batched_agents import Trajectory
 
 
 class MapContinuousToAction(nn.Module):
@@ -20,6 +25,7 @@ class MapContinuousToAction(nn.Module):
     be positive, this class will map the range [-1, 1] for those values to the desired range (defaults to [0.1, 1]) using
     a simple linear transform.
     """
+
     def __init__(self, range_min=0.1, range_max=1):
         super().__init__()
 
@@ -33,49 +39,65 @@ class MapContinuousToAction(nn.Module):
         return x[..., :n], x[..., n:] * self.m + self.b
 
 
-def compute_gae(rews, dones, truncated, values, gamma=0.99, lmbda=0.95, return_std=1):
+def compute_gae(
+    trajectories: List[
+        Trajectory[AgentID, ActionType, ObsType, RewardTypeWrapper[RewardType]]
+    ],
+    gamma=0.99,
+    lmbda=0.95,
+    return_std=1,
+):
     """
     Function to estimate the advantage function for a series of states and actions using the
     general advantage estimator (GAE).
 
-    :param rews: List of rewards.
-    :param dones: List of done signals.
-    :param truncated: List of truncated signals.
-    :param values: List of value function estimates.
+    :param trajectories: List of trajectories with value predictions.
     :param gamma: Gamma hyper-parameter.
     :param lmbda: Lambda hyper-parameter.
     :param return_std: Standard deviation of the returns (used for reward normalization).
     :return: Bootstrapped value function estimates, GAE results, returns.
     """
-    next_values = values[1:]
+    observations: List[ObsType] = []
+    actions: List[ActionType] = []
+    log_probs: List[torch.Tensor] = []
+    rewards: List[torch.Tensor] = []
+    terminateds: List[bool] = []
+    truncateds: List[bool] = []
+    values: List[float] = []
+    advantages: List[float] = []
+    returns: List[float] = []
+    for trajectory in trajectories:
+        cur_return = trajectory.final_val_pred
+        next_val_pred = trajectory.final_val_pred
+        cur_advantages = torch.Tensor(0)
+        for timestep in reversed(trajectory.complete_timesteps):
+            (obs, action, log_prob, reward, terminated, truncated, val_pred) = timestep
+            reward_tensor = reward.as_tensor()
+            delta = reward_tensor + gamma * next_val_pred - val_pred
+            next_val_pred = val_pred
+            cur_advantages = delta + gamma * lmbda * cur_advantages
+            cur_return = reward_tensor + gamma * cur_return
+            returns.append(cur_return.detach().item())
+            observations.append(obs)
+            actions.append(action)
+            log_probs.append(log_prob)
+            rewards.append(reward_tensor)
+            terminateds.append(terminated)
+            truncateds.append(truncated)
+            values.append(val_pred)
+            advantages.append(cur_advantages)
 
-    last_gae_lam = 0
-    n_returns = len(rews)
-    adv = [0 for _ in range(n_returns)]
-    returns = [0 for _ in range(n_returns)]
-    last_return = 0
-
-    for step in reversed(range(n_returns)):
-        not_done = 1 - dones[step]
-        not_trunc = 1 - truncated[step]
-
-        if return_std is not None:
-            norm_rew = min(max(rews[step] / return_std, -10), 10)
-        else:
-            norm_rew = rews[step]
-
-        pred_ret = norm_rew + gamma * next_values[step] * not_done
-        delta = pred_ret - values[step]
-        ret = rews[step] + last_return * gamma * not_done * not_trunc
-        returns[step] = ret
-        last_return = ret
-        last_gae_lam = delta + gamma * lmbda * not_done * not_trunc * last_gae_lam
-        adv[step] = last_gae_lam
-
-
-    advantages = torch.as_tensor(adv, dtype=torch.float32)
-    values = torch.as_tensor([v + a for v, a in zip(values[:-1], adv)], dtype=torch.float32)
-    return values, advantages, returns
+    return (
+        observations,
+        actions,
+        log_probs,
+        rewards,
+        terminateds,
+        truncateds,
+        values,
+        advantages,
+        returns,
+    )
 
 
 class MultiDiscreteRolv(nn.Module):
@@ -85,6 +107,7 @@ class MultiDiscreteRolv(nn.Module):
     such that each of the 8 actions has 3 options (to avoid a ragged list), then builds a categorical distribution over
     each class for each action. Credit to Rolv Arild for coming up with this method.
     """
+
     def __init__(self, bins):
         super().__init__()
         self.distribution = None
@@ -104,7 +127,9 @@ class MultiDiscreteRolv(nn.Module):
         triplets = torch.stack(logits[:5], dim=-1)
 
         # Separate duets and pad the final dimension with -inf to create triplets.
-        duets = torch.nn.functional.pad(torch.stack(logits[5:], dim=-1), pad=(0,0,0,1), value=float("-inf"))
+        duets = torch.nn.functional.pad(
+            torch.stack(logits[5:], dim=-1), pad=(0, 0, 0, 1), value=float("-inf")
+        )
 
         # Un-split the logits now that the duets have been converted into triplets and reshape them into the correct shape.
         logits = torch.cat((triplets, duets), dim=-1).swapdims(-1, -2)
@@ -119,4 +144,6 @@ class MultiDiscreteRolv(nn.Module):
         return self.distribution.sample()
 
     def entropy(self):
-        return self.distribution.entropy().sum(dim=-1) # Unsure about this sum operation.
+        return self.distribution.entropy().sum(
+            dim=-1
+        )  # Unsure about this sum operation.

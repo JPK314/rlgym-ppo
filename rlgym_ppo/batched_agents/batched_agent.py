@@ -1,4 +1,43 @@
-def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, seed, render, render_delay):
+from typing import Type
+
+import numpy as np
+from rlgym.api import (
+    ActionSpaceType,
+    ActionType,
+    AgentID,
+    ObsSpaceType,
+    ObsType,
+    RewardType,
+)
+
+from rlgym_ppo.api import (
+    ActionSpaceTypeSerde,
+    ActionTypeSerde,
+    AgentIDSerde,
+    ObsSpaceTypeSerde,
+    ObsTypeSerde,
+    RewardTypeSerde,
+)
+from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
+
+
+def batched_agent_process(
+    proc_id,
+    endpoint,
+    agent_id_serde: Type[AgentIDSerde[AgentID]],
+    action_type_serde: Type[ActionTypeSerde[ActionType]],
+    obs_type_serde: Type[ObsTypeSerde[ObsType]],
+    reward_type_serde: Type[RewardTypeSerde[RewardType]],
+    action_space_type_serde: Type[ActionSpaceTypeSerde[ActionSpaceType]],
+    obs_space_type_serde: Type[ObsSpaceTypeSerde[ObsSpaceType]],
+    shm_buffer,
+    shm_offset: int,
+    shm_size: int,
+    seed,
+    render: bool,
+    render_delay: float,
+    recalculate_agentid_every_step: bool,
+):
     """
     Function to interact with an environment and communicate with the learner through a pipe.
 
@@ -16,41 +55,42 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
     import pickle
     import socket
     import time
+    from typing import Callable, Generic, List, Union
 
-    import gym
     import numpy as np
+    from rlgym.api import (
+        ActionSpaceType,
+        EngineActionType,
+        ObsSpaceType,
+        RLGym,
+        StateType,
+    )
 
     from rlgym_ppo.batched_agents import comm_consts
+    from rlgym_ppo.batched_agents.comm_consts import BOOL_SIZE, INTEGER_SIZE
 
     if render:
         try:
             from rlviser_py import get_game_paused, get_game_speed
         except ImportError:
+
             def get_game_speed() -> float:
                 return 1.0
 
             def get_game_paused() -> bool:
                 return False
 
-    def _append_array(array, offset, data):
-        size = data.size if isinstance(data, np.ndarray) else len(data)
-        end = offset + size
-        array[offset:end] = data[:]
-        return end
-
     env = None
     metrics_encoding_function = None
     shm_view = None
-    shm_shapes = None
 
     POLICY_ACTIONS_HEADER = comm_consts.POLICY_ACTIONS_HEADER
     ENV_SHAPES_HEADER = comm_consts.ENV_SHAPES_HEADER
     STOP_MESSAGE_HEADER = comm_consts.STOP_MESSAGE_HEADER
 
-    PACKED_ENV_STEP_DATA_HEADER = comm_consts.pack_message(
+    PACKED_ENV_STEP_DATA_HEADER = comm_consts.pack_header(
         comm_consts.ENV_STEP_DATA_HEADER
     )
-    header_len = comm_consts.HEADER_LEN
 
     # Create a socket and send dummy data to tell parent our endpoint
     pipe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -59,108 +99,234 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
 
     # Wait for initialization data from the learner.
     while env is None:
-        data = pickle.loads(pipe.recv(4096))
+        data = pickle.loads(pipe.recv(PACKET_MAX_SIZE))
         if data[0] == "initialization_data":
-            build_env_fn = data[1]
-            metrics_encoding_function = data[2]
+            build_env_fn: Callable[
+                [],
+                RLGym[
+                    AgentID,
+                    ObsType,
+                    ActionType,
+                    EngineActionType,
+                    RewardType,
+                    StateType,
+                    ObsSpaceType,
+                    ActionSpaceType,
+                ],
+            ] = data[1]
+            metrics_encoding_function: Callable[[StateType], np.ndarray] = data[2]
 
             env = build_env_fn()
 
-    # Seed everything.
-    env.action_space.seed(seed)
-    reset_state = env.reset()
+    reset_obs = env.reset()
+    # ASSUMPTION: AgentID hash is not modified during the course of an episode
+    agent_id_ordering = {idx: agent_id for (idx, agent_id) in enumerate(env.agents)}
+    serialized_agent_ids = {agent_id: agent_id.to_bytes() for agent_id in env.agents}
+    prev_serialized_agent_ids = {
+        key: value for (key, value) in serialized_agent_ids.items()
+    }
+    done_agents = {agent_id: False for agent_id in env.agents}
+    persistent_truncated_dict = {agent_id: False for agent_id in env.agents}
+    persistent_terminated_dict = {agent_id: False for agent_id in env.agents}
+    n_agents = len(env.agents)
+    # TODO: pack directly into shm_view
+    obs_buffer = comm_consts.pack_int(n_agents)
+    for agent_id, obs in reset_obs.items():
+        agent_id_bytes = serialized_agent_ids[agent_id]
+        obs_bytes = obs.to_bytes()
+        obs_buffer += comm_consts.pack_int(len(agent_id_bytes))
+        obs_buffer += agent_id_bytes
+        obs_buffer += comm_consts.pack_int(len(obs_bytes))
+        obs_buffer += obs_bytes
 
-    if type(reset_state) != np.ndarray:
-        reset_state = np.asarray(reset_state, dtype=np.float32)
-    elif reset_state.dtype != np.float32:
-        reset_state = reset_state.astype(np.float32)
-
-    state_shape = [float(arg) for arg in np.shape(reset_state)]
-    n_elements_in_state_shape = float(len(state_shape))
-    n_agents = state_shape[0] if n_elements_in_state_shape > 1 else 1
-    obs_buffer = reset_state.tobytes()
-
-    message_floats = (
-        comm_consts.ENV_RESET_STATE_HEADER + [n_elements_in_state_shape] + state_shape
+    # construct shm_view
+    count = len(obs_buffer)
+    assert (
+        count <= shm_size
+    ), "ATTEMPTED TO CREATE AGENT MESSAGE BUFFER LARGER THAN MAXIMUM ALLOWED SIZE"
+    shm_view = np.frombuffer(
+        buffer=shm_buffer,
+        dtype=np.byte,
+        offset=shm_offset,
+        count=count,
     )
-    packed_message_floats = comm_consts.pack_message(message_floats) + obs_buffer
+    shm_view[:] = obs_buffer
+    packed_message_floats = comm_consts.pack_header(comm_consts.ENV_RESET_STATE_HEADER)
     pipe.sendto(packed_message_floats, endpoint)
 
-    action_buffer = None
-    action_slice_size = 0
-
-    frombuffer = np.frombuffer
-
     prev_n_agents = n_agents
-
     # Primary interaction loop.
     try:
         while True:
-            message_bytes = pipe.recv(4096)
-            message = frombuffer(message_bytes, dtype=np.float32)
-            # message = byte_headers.unpack_message(message_bytes)
-            header = message[:header_len]
+            socket_data = pipe.recv(PACKET_MAX_SIZE)
+            (header, socket_offset) = comm_consts.unpack_header(socket_data)
 
             if header[0] == POLICY_ACTIONS_HEADER[0]:
-                prev_n_agents = n_agents
-                data = message[header_len:]
+                actions_dict = {}
+                for _ in range(n_agents):
+                    (agent_id_bytes, socket_offset) = comm_consts.retrieve_bytes(
+                        socket_data, socket_offset
+                    )
+                    agent_id = agent_id_serde.from_bytes(agent_id_bytes)
+                    (action_bytes, socket_offset) = comm_consts.retrieve_bytes(
+                        socket_data, socket_offset
+                    )
+                    action = action_type_serde.from_bytes(action_bytes)
+                    actions_dict[agent_id] = action
 
-                if action_buffer is None:
-                    action_buffer = np.reshape(data, (int(n_agents), -1)).copy()
-                    action_slice_size = action_buffer.shape[1]
-                else:
-                    for i in range(int(n_agents)):
-                        action_buffer[i] = data[
-                            i * action_slice_size : (i + 1) * action_slice_size
-                        ]
+                obs_dict, rew_dict, terminated_dict, truncated_dict = env.step(
+                    actions_dict
+                )
+                for agent_id in env.agents:
+                    if (
+                        persistent_terminated_dict[agent_id]
+                        or persistent_truncated_dict[agent_id]
+                    ):
+                        continue
+                    persistent_terminated_dict[agent_id] = terminated_dict[agent_id]
+                    persistent_truncated_dict[agent_id] = truncated_dict[agent_id]
 
-                # print("got actions", action_buffer.shape,"|",n_agents,"|",prev_n_agents)
-                step_data = env.step(action_buffer)
-                if len(step_data) == 4:
-                    truncated = False
-                    obs, rew, done, info = step_data
-                else:
-                    obs, rew, done, truncated, info = step_data
+                new_episode = True
+                for agent_id in env.agents:
+                    done_agents[agent_id] |= (
+                        persistent_terminated_dict[agent_id]
+                        or persistent_truncated_dict[agent_id]
+                    )
+                    new_episode *= done_agents[agent_id]
 
-                if n_agents == 1:
-                    rew = [float(rew)]
-
-                if done or truncated:
-                    obs = np.asarray(env.reset(), dtype=np.float32)
-                    n_agents = float(obs.shape[0]) if len(obs.shape) > 1 else 1
-
-                    state_shape = [float(arg) for arg in obs.shape]
-                    n_elements_in_state_shape = len(state_shape)
-
-                    action_buffer = np.zeros((int(n_agents), action_buffer.shape[-1]))
-
-                if type(obs) != np.ndarray:
-                    obs = np.asarray(obs, dtype=np.float32)
-                elif obs.dtype != np.float32:
-                    obs = obs.astype(np.float32)
-
-                done = 1.0 if done else 0.0
-                truncated = 1.0 if truncated else 0.0
+                if new_episode:
+                    new_episode_obs_dict = env.reset()
+                    agent_id_ordering = {
+                        idx: agent_id for (idx, agent_id) in enumerate(env.agents)
+                    }
+                    # TODO: do I need to create a new dict like this?
+                    prev_serialized_agent_ids = {
+                        key: value for (key, value) in serialized_agent_ids.items()
+                    }
+                    serialized_agent_ids = {
+                        agent_id: agent_id_serde.to_bytes(agent_id)
+                        for agent_id in env.agents
+                    }
+                    prev_n_agents = n_agents
+                    n_agents = len(env.agents)
+                    done_agents = {agent_id: False for agent_id in env.agents}
 
                 if metrics_encoding_function is not None:
-                    metrics = metrics_encoding_function(info["state"])
-                    metrics_shape = [float(arg) for arg in metrics.shape]
+                    metrics = metrics_encoding_function(env.state)
+                    metrics_shape: List[int] = [arg for arg in metrics.shape]
                 else:
                     metrics = np.empty(shape=(0,))
                     metrics_shape = []
 
-                if shm_view is None or shm_shapes != (prev_n_agents, n_agents):
-                    shm_shapes = (prev_n_agents, n_agents)
-                    count = 5 + len(metrics_shape) + len(state_shape) + len(rew) + metrics.size + obs.size
-                    assert(count <= shm_size), "ATTEMPTED TO CREATE AGENT MESSAGE BUFFER LARGER THAN MAXIMUM ALLOWED SIZE"
-                    shm_view = np.frombuffer(buffer=shm_buffer, dtype=np.float32, offset=shm_offset, count=count)
+                if recalculate_agentid_every_step and not new_episode:
+                    serialized_agent_ids = {
+                        agent_id: agent_id_serde.to_bytes(agent_id)
+                        for agent_id in env.agents
+                    }
+                offset = 0
+                offset = comm_consts.append_bool(
+                    shm_view, offset, new_episode, shm_size
+                )
+                if new_episode:
+                    offset = comm_consts.append_int(
+                        shm_view, offset, prev_n_agents, shm_size
+                    )
+                    for (
+                        agent_id,
+                        serialized_agent_id,
+                    ) in prev_serialized_agent_ids.items():
+                        offset = comm_consts.append_bytes(
+                            shm_view, offset, serialized_agent_id, shm_size
+                        )
+                        offset = comm_consts.append_bytes(
+                            shm_view,
+                            offset,
+                            obs_type_serde.to_bytes(obs_dict[agent_id]),
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bytes(
+                            shm_view,
+                            offset,
+                            reward_type_serde.to_bytes(rew_dict[agent_id]),
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bool(
+                            shm_view,
+                            offset,
+                            persistent_terminated_dict[agent_id],
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bool(
+                            shm_view,
+                            offset,
+                            persistent_truncated_dict[agent_id],
+                            shm_size,
+                        )
+                    offset = comm_consts.append_int(
+                        shm_view, offset, n_agents, shm_size
+                    )
+                    for agent_id, serialized_agent_id in serialized_agent_ids.items():
+                        offset = comm_consts.append_bytes(
+                            shm_view, offset, serialized_agent_id, shm_size
+                        )
+                        offset = comm_consts.append_bytes(
+                            shm_view,
+                            offset,
+                            obs_type_serde.to_bytes(new_episode_obs_dict[agent_id]),
+                            shm_size,
+                        )
+                else:
+                    # TODO: use agent ordering instead of passing agent id bytes if recalculate every step is false
+                    offset = comm_consts.append_int(
+                        shm_view, offset, n_agents, shm_size
+                    )
+                    for agent_id in env.agents:
+                        offset = comm_consts.append_bytes(
+                            shm_view, offset, serialized_agent_ids[agent_id], shm_size
+                        )
+                        offset = comm_consts.append_bytes(
+                            shm_view,
+                            offset,
+                            agent_id_serde.to_bytes(obs_dict[agent_id]),
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bytes(
+                            shm_view,
+                            offset,
+                            reward_type_serde.to_bytes(rew_dict[agent_id]),
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bool(
+                            shm_view,
+                            offset,
+                            persistent_terminated_dict[agent_id],
+                            shm_size,
+                        )
+                        offset = comm_consts.append_bool(
+                            shm_view,
+                            offset,
+                            persistent_truncated_dict[agent_id],
+                            shm_size,
+                        )
 
-                offset = _append_array(shm_view, 0, [prev_n_agents, done, truncated, n_elements_in_state_shape, len(metrics_shape)])
-                offset = _append_array(shm_view, offset, metrics_shape)
-                offset = _append_array(shm_view, offset, state_shape)
-                offset = _append_array(shm_view, offset, rew)
-                offset = _append_array(shm_view, offset, metrics)
-                offset = _append_array(shm_view, offset, obs.flatten())
+                offset = comm_consts.append_int(
+                    shm_view, offset, len(metrics_shape), shm_size
+                )
+                for shape_dim in metrics_shape:
+                    offset = comm_consts.append_int(
+                        shm_view, offset, shape_dim, shm_size
+                    )
+                offset = comm_consts.append_bytes(
+                    shm_view, offset, metrics.tobytes(), shm_size
+                )
+
+                if new_episode:
+                    persistent_truncated_dict = {
+                        agent_id: False for agent_id in env.agents
+                    }
+                    persistent_terminated_dict = {
+                        agent_id: False for agent_id in env.agents
+                    }
 
                 pipe.sendto(PACKED_ENV_STEP_DATA_HEADER, endpoint)
 
@@ -173,35 +339,22 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                         time.sleep(0.1)
 
             elif header[0] == ENV_SHAPES_HEADER[0]:
-                t = type(env.action_space)
-                action_space_type = 0.0  # "discrete"
-                action_type = "Discrete"
-                if t == gym.spaces.multi_discrete.MultiDiscrete:
-                    action_space_type = 1.0  # "multi-discrete"
-                    action_type = "Multi-discrete"
-                elif t == gym.spaces.box.Box:
-                    action_space_type = 2.0  # "continuous"
-                    action_type = "Continuous"
-
-                if hasattr(env.action_space, "n"):
-                    n_acts = float(env.action_space.n)
-                else:
-                    n_acts = float(np.prod(env.action_space.shape))
+                obs_space = env.observation_spaces.values()[0]
+                action_space = env.action_spaces.values()[0]
 
                 # Print out the environment shapes and action space type.
                 print("Received request for env shapes, returning:")
-                print(F"- Observations shape: {env.observation_space.shape}")
-                print(F"- Number of actions: {n_acts}")
-                print(F"- Action space type: {action_space_type} ({action_type})")
+                print(f"- Observation space type: {repr(obs_space)}")
+                print(f"- Action space type: {repr(action_space)}")
                 print("--------------------")
-
-                env_shape = float(np.prod(env.observation_space.shape))
-                message_floats = ENV_SHAPES_HEADER + [
-                    env_shape,
-                    n_acts,
-                    action_space_type,
-                ]
-                pipe.sendto(comm_consts.pack_message(message_floats), endpoint)
+                message = comm_consts.pack_header(ENV_SHAPES_HEADER)
+                message += comm_consts.pack_bytes(
+                    obs_space_type_serde.to_bytes(obs_space)
+                )
+                message += comm_consts.pack_bytes(
+                    action_space_type_serde.to_bytes(action_space)
+                )
+                pipe.sendto(message, endpoint)
 
             elif header[0] == STOP_MESSAGE_HEADER[0]:
                 break

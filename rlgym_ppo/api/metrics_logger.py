@@ -1,12 +1,14 @@
-from abc import ABC
+from abc import abstractmethod
+from typing import Generic
 
 import numpy as np
-from rlgym.rocket_league.api import GameState
+from rlgym.api import StateType
 
 
-class MetricsLogger(ABC):
-    def collect_metrics(self, game_state: GameState) -> np.ndarray:
-        metrics_arrays = self._collect_metrics(game_state)
+# TODO: add metrics logger for policy reward (episodic undiscounted return)
+class MetricsLogger(Generic[StateType]):
+    def collect_metrics(self, state: StateType) -> np.ndarray:
+        metrics_arrays = self._collect_metrics(state)
         unraveled = []
         for arr in metrics_arrays:
             shape = np.shape(arr)
@@ -42,8 +44,10 @@ class MetricsLogger(ABC):
 
         self._report_metrics(all_reports, wandb_run, cumulative_timesteps)
 
-    def _collect_metrics(self, game_state: GameState) -> np.ndarray:
+    @abstractmethod
+    def _collect_metrics(self, state: StateType) -> np.ndarray:
         raise NotImplementedError
 
+    @abstractmethod
     def _report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
         raise NotImplementedError

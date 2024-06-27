@@ -21,3 +21,9 @@ learner.learn()
 ```
 Note that users must implement a function to configure Rocket League (or RocketSim) in RLGym that returns an 
 RLGym environment. See the `example.py` file for an example of writing such a function.
+
+
+Assumptions:
+1. The AgentID hash must not change until the next environment reset() call once it is returned from reset().
+2. The obs space type and action space type should not change after the associated configuration objects' associated get_x_type functions have been called, and they should be the same across all agents and all envs.
+3. If an `__add__` method is added to the RewardType method for use in the metrics logger, the `as_tensor()` method should be a homomorphism from the group formed under addition for RewardType instances to the group of Tensors under addition to keep the metrics accurate to what's going on in learning.
