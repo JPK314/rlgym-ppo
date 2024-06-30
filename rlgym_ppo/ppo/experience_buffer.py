@@ -45,9 +45,6 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         self.observations: List[Tuple[AgentID, ObsType]] = []
         self.actions: List[ActionType] = []
         self.log_probs = torch.FloatTensor().to(self.device)
-        self.rewards = torch.FloatTensor().to(self.device)
-        self.terminateds = torch.FloatTensor().to(self.device)
-        self.truncateds = torch.FloatTensor().to(self.device)
         self.values = torch.FloatTensor().to(self.device)
         self.advantages = torch.FloatTensor().to(self.device)
         self.max_size = max_size
@@ -133,9 +130,6 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         del self.observations
         del self.actions
         del self.log_probs
-        del self.rewards
-        del self.terminateds
-        del self.truncateds
         del self.values
         del self.advantages
         self.__init__(self.max_size, self.seed, self.device)
