@@ -115,7 +115,7 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         :return:
         """
 
-        total_samples = self.rewards.shape[0]
+        total_samples = self.values.shape[0]
         indices = self.rng.permutation(total_samples)
         start_idx = 0
         while start_idx + batch_size <= total_samples:
