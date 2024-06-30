@@ -58,9 +58,6 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         observations: List[Tuple[AgentID, ObsType]],
         actions: List[ActionType],
         log_probs: List[torch.Tensor],
-        rewards: List[torch.Tensor],
-        terminateds: List[bool],
-        truncateds: List[bool],
         values: List[torch.Tensor],
         advantages: List[torch.Tensor],
     ):
@@ -87,21 +84,6 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
             torch.as_tensor(log_probs, dtype=torch.float32, device=self.device),
             self.max_size,
         )
-        self.rewards = _cat(
-            self.rewards,
-            torch.as_tensor(rewards, dtype=torch.float32, device=self.device),
-            self.max_size,
-        )
-        self.terminateds = _cat(
-            self.terminateds,
-            torch.as_tensor(terminateds, dtype=torch.float32, device=self.device),
-            self.max_size,
-        )
-        self.truncateds = _cat(
-            self.truncateds,
-            torch.as_tensor(truncateds, dtype=torch.float32, device=self.device),
-            self.max_size,
-        )
         self.values = _cat(
             self.values,
             torch.as_tensor(values, dtype=torch.float32, device=self.device),
@@ -121,9 +103,9 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         torch.Tensor,
     ]:
         return (
+            [self.observations[index] for index in indices],
             [self.actions[index] for index in indices],
             self.log_probs[indices],
-            [self.observations[index] for index in indices],
             self.values[indices],
             self.advantages[indices],
         )

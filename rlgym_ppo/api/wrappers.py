@@ -2,7 +2,7 @@ from abc import abstractmethod
 from typing import Generic
 
 from rlgym.api import RewardType
-from torch import Tensor
+from torch import Tensor, device, dtype
 
 
 class RewardTypeWrapper(Generic[RewardType]):

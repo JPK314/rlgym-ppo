@@ -28,6 +28,8 @@ class BatchedTrajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
         """
         for agent_id, trajectory in self.agent_trajectories.items():
             trajectory.final_obs = obs_dict[agent_id]
+            if trajectory.truncated == None:
+                trajectory.truncated = True
 
     def add_timesteps(
         self,

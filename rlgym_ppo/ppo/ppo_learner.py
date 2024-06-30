@@ -102,9 +102,9 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
             batches = exp.get_all_batches_shuffled(self.batch_size)
             for batch in batches:
                 (
+                    batch_obs,
                     batch_acts,
                     batch_old_probs,
-                    batch_obs,
                     batch_values,
                     batch_advantages,
                 ) = batch

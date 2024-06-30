@@ -13,7 +13,7 @@ import os
 import random
 import shutil
 import time
-from typing import Callable, Generic, List, Optional, Tuple, Type, Union
+from typing import Callable, Generic, List, Optional, Tuple, Type, TypedDict, Union
 
 import numpy as np
 import torch
@@ -43,6 +43,83 @@ from rlgym_ppo.api import (
 from rlgym_ppo.batched_agents import BatchedAgentManager, Trajectory
 from rlgym_ppo.ppo import ExperienceBuffer, PPOLearner
 from rlgym_ppo.util import KBHit, WelfordRunningStat, reporting, torch_functions
+
+
+class LearnerConfig(TypedDict):
+    n_proc: int
+    min_inference_size: int
+    render: bool
+    render_delay: float
+    timestep_limit: int
+    exp_buffer_size: int
+    ts_per_iteration: int
+    standardize_returns: bool
+    max_returns_per_stats_increment: int
+    steps_per_obs_stats_increment: int
+    ppo_epochs: int
+    ppo_batch_size: int
+    ppo_minibatch_size: Optional[int]
+    ppo_ent_coef: float
+    ppo_clip_range: float
+    gae_lambda: float
+    gae_gamma: float
+    policy_lr: float
+    critic_lr: float
+    log_to_wandb: bool
+    load_wandb: bool
+    wandb_run: Optional[Run]
+    wandb_project_name: Optional[str]
+    wandb_group_name: Optional[str]
+    wandb_run_name: Optional[str]
+    checkpoints_save_folder: Optional[str]
+    add_unix_timestamp: bool
+    checkpoint_load_folder: Optional[str]
+    save_every_ts: int
+    instance_launch_delay: Optional[float]
+    random_seed: int
+    n_checkpoints_to_keep: int
+    shm_buffer_size: int
+    device: str
+    recalculate_agent_id_every_step: bool
+
+
+DEFAULT_CONFIG: LearnerConfig = {
+    "n_proc": 8,
+    "min_inference_size": 80,
+    "render": False,
+    "render_delay": 0,
+    "timestep_limit": 5_000_000_000,
+    "exp_buffer_size": 100000,
+    "ts_per_iteration": 50000,
+    "standardize_returns": True,
+    "max_returns_per_stats_increment": 150,
+    "steps_per_obs_stats_increment": 5,
+    "ppo_epochs": 10,
+    "ppo_batch_size": 50000,
+    "ppo_minibatch_size": None,
+    "ppo_ent_coef": 0.005,
+    "ppo_clip_range": 0.2,
+    "gae_lambda": 0.95,
+    "gae_gamma": 0.99,
+    "policy_lr": 3e-4,
+    "critic_lr": 3e-4,
+    "log_to_wandb": False,
+    "load_wandb": True,
+    "wandb_run": None,
+    "wandb_project_name": None,
+    "wandb_group_name": None,
+    "wandb_run_name": None,
+    "checkpoints_save_folder": None,
+    "add_unix_timestamp": True,
+    "checkpoint_load_folder": None,
+    "save_every_ts": 1_000_000,
+    "instance_launch_delay": None,
+    "random_seed": 123,
+    "n_checkpoints_to_keep": 5,
+    "shm_buffer_size": 8192,
+    "device": "auto",
+    "recalculate_agent_id_every_step": False,
+}
 
 
 class Learner(
@@ -85,42 +162,9 @@ class Learner(
         ],
         value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
         metrics_logger: Optional[MetricsLogger[StateType]] = None,
-        n_proc: int = 8,
-        min_inference_size: int = 80,
-        render: bool = False,
-        render_delay: float = 0,
-        timestep_limit: int = 5_000_000_000,
-        exp_buffer_size: int = 100000,
-        ts_per_iteration: int = 50000,
-        standardize_returns: bool = True,
-        max_returns_per_stats_increment: int = 150,
-        steps_per_obs_stats_increment: int = 5,
-        ppo_epochs: int = 10,
-        ppo_batch_size: int = 50000,
-        ppo_minibatch_size: Union[int, None] = None,
-        ppo_ent_coef: float = 0.005,
-        ppo_clip_range: float = 0.2,
-        gae_lambda: float = 0.95,
-        gae_gamma: float = 0.99,
-        policy_lr: float = 3e-4,
-        critic_lr: float = 3e-4,
-        log_to_wandb: bool = False,
-        load_wandb: bool = True,
-        wandb_run: Union[Run, None] = None,
-        wandb_project_name: Union[str, None] = None,
-        wandb_group_name: Union[str, None] = None,
-        wandb_run_name: Union[str, None] = None,
-        checkpoints_save_folder: Union[str, None] = None,
-        add_unix_timestamp: bool = True,
-        checkpoint_load_folder: Union[str, None] = None,
-        save_every_ts: int = 1_000_000,
-        instance_launch_delay: Union[float, None] = None,
-        random_seed: int = 123,
-        n_checkpoints_to_keep: int = 5,
-        shm_buffer_size: int = 8192,
-        device: str = "auto",
-        recalculate_agent_id_every_step=False,
+        config: LearnerConfig = {},
     ):
+        self.config: LearnerConfig = {**DEFAULT_CONFIG, **config}
 
         assert (
             env_create_function is not None
@@ -133,40 +177,33 @@ class Learner(
 
         # Add the option for the user to turn off the addition of Unix Timestamps to
         # the ``checkpoints_save_folder`` path
-        if add_unix_timestamp:
+        if config["add_unix_timestamp"]:
             checkpoints_save_folder = f"{checkpoints_save_folder}-{time.time_ns()}"
 
-        torch.manual_seed(random_seed)
-        np.random.seed(random_seed)
-        random.seed(random_seed)
+        torch.manual_seed(config["random_seed"])
+        np.random.seed(config["random_seed"])
+        random.seed(config["random_seed"])
 
-        self.n_checkpoints_to_keep = n_checkpoints_to_keep
         self.checkpoints_save_folder = checkpoints_save_folder
-        self.max_returns_per_stats_increment = max_returns_per_stats_increment
         self.metrics_logger = metrics_logger
-        self.standardize_returns = standardize_returns
-        self.save_every_ts = save_every_ts
         self.ts_since_last_save = 0
 
-        if device in {"auto", "gpu"} and torch.cuda.is_available():
+        if config["device"] in {"auto", "gpu"} and torch.cuda.is_available():
             self.device = "cuda:0"
             torch.backends.cudnn.benchmark = True
-        elif device == "auto" and not torch.cuda.is_available():
+        elif config["device"] == "auto" and not torch.cuda.is_available():
             self.device = "cpu"
         else:
-            self.device = device
+            self.device = config["device"]
 
         print(f"Using device {self.device}")
-        self.exp_buffer_size = exp_buffer_size
-        self.timestep_limit = timestep_limit
-        self.ts_per_epoch = ts_per_iteration
-        self.gae_lambda = gae_lambda
-        self.gae_gamma = gae_gamma
         self.return_stats = WelfordRunningStat(1)
         self.epoch = 0
 
         self.experience_buffer: ExperienceBuffer[AgentID, ObsType, ActionType] = (
-            ExperienceBuffer(self.exp_buffer_size, seed=random_seed, device="cpu")
+            ExperienceBuffer(
+                config["exp_buffer_size"], seed=config["random_seed"], device="cpu"
+            )
         )
 
         print("Initializing processes...")
@@ -182,69 +219,64 @@ class Learner(
             reward_type_serde,
             obs_space_type_serde,
             action_space_type_serde,
-            min_inference_size=min_inference_size,
-            seed=random_seed,
-            steps_per_obs_stats_increment=steps_per_obs_stats_increment,
-            recalculate_agent_id_every_step=recalculate_agent_id_every_step,
+            min_inference_size=config["min_inference_size"],
+            seed=config["random_seed"],
+            steps_per_obs_stats_increment=config["steps_per_obs_stats_increment"],
+            recalculate_agent_id_every_step=config["recalculate_agent_id_every_step"],
         )
         (policy, value_net) = self.agent.init_processes(
             policy_factory=policy_factory,
             value_net_factory=value_net_factory,
             device=self.device,
-            n_processes=n_proc,
+            n_processes=config["n_proc"],
             collect_metrics_fn=collect_metrics_fn,
-            spawn_delay=instance_launch_delay,
-            render=render,
-            render_delay=render_delay,
-            shm_buffer_size=shm_buffer_size,
+            spawn_delay=config["instance_launch_delay"],
+            render=config["render"],
+            render_delay=config["render_delay"],
+            shm_buffer_size=config["shm_buffer_size"],
         )
         print("Initializing PPO...")
         if ppo_minibatch_size is None:
-            ppo_minibatch_size = ppo_batch_size
+            ppo_minibatch_size = config["ppo_batch_size"]
 
         self.ppo_learner = PPOLearner(
             policy=policy,
             value_net=value_net,
             device=self.device,
-            batch_size=ppo_batch_size,
+            batch_size=config["ppo_batch_size"],
             mini_batch_size=ppo_minibatch_size,
-            n_epochs=ppo_epochs,
-            policy_lr=policy_lr,
-            critic_lr=critic_lr,
-            clip_range=ppo_clip_range,
-            ent_coef=ppo_ent_coef,
+            n_epochs=config["ppo_epochs"],
+            policy_lr=config["policy_lr"],
+            critic_lr=config["critic_lr"],
+            clip_range=config["ppo_clip_range"],
+            ent_coef=config["ppo_ent_coef"],
         )
 
         self.agent.policy = self.ppo_learner.policy
 
-        self.config = {
-            "n_proc": n_proc,
-            "min_inference_size": min_inference_size,
-            "timestep_limit": timestep_limit,
-            "exp_buffer_size": exp_buffer_size,
-            "ts_per_iteration": ts_per_iteration,
-            "standardize_returns": standardize_returns,
-            "ppo_epochs": ppo_epochs,
-            "ppo_batch_size": ppo_batch_size,
-            "ppo_minibatch_size": ppo_minibatch_size,
-            "ppo_ent_coef": ppo_ent_coef,
-            "ppo_clip_range": ppo_clip_range,
-            "gae_lambda": gae_lambda,
-            "gae_gamma": gae_gamma,
-            "policy_lr": policy_lr,
-            "critic_lr": critic_lr,
-            "shm_buffer_size": shm_buffer_size,
-        }
-
-        self.wandb_run = wandb_run
-        wandb_loaded = checkpoint_load_folder is not None and self.load(
-            checkpoint_load_folder, load_wandb, policy_lr, critic_lr
+        wandb_loaded = config["checkpoint_load_folder"] is not None and self.load(
+            config["checkpoint_load_folder"],
+            config["load_wandb"],
+            config["policy_lr"],
+            config["critic_lr"],
         )
 
-        if log_to_wandb and self.wandb_run is None and not wandb_loaded:
-            project = "rlgym-ppo" if wandb_project_name is None else wandb_project_name
-            group = "unnamed-runs" if wandb_group_name is None else wandb_group_name
-            run_name = "rlgym-ppo-run" if wandb_run_name is None else wandb_run_name
+        if config["log_to_wandb"] and self.wandb_run is None and not wandb_loaded:
+            project = (
+                "rlgym-ppo"
+                if config["wandb_project_name"] is None
+                else config["wandb_project_name"]
+            )
+            group = (
+                "unnamed-runs"
+                if config["wandb_group_name"] is None
+                else config["wandb_group_name"]
+            )
+            run_name = (
+                "rlgym-ppo-run"
+                if config["wandb_run_name"] is None
+                else config["wandb_run_name"]
+            )
             print("Attempting to create new wandb run...")
             self.wandb_run = wandb.init(
                 project=project,
@@ -305,13 +337,13 @@ class Learner(
 
         # While the number of timesteps we have collected so far is less than the
         # amount we are allowed to collect.
-        while self.agent.cumulative_timesteps < self.timestep_limit:
+        while self.agent.cumulative_timesteps < self.config["timestep_limit"]:
             epoch_start = time.perf_counter()
             report = {}
 
             # Collect the desired number of timesteps from our agent.
             trajectories, collected_metrics, steps_collected, collection_time = (
-                self.agent.collect_timesteps(self.ts_per_epoch)
+                self.agent.collect_timesteps(self.config["ts_per_epoch"])
             )
 
             if self.metrics_logger is not None:
@@ -379,7 +411,7 @@ class Learner(
                     print("Resuming...\n")
 
             # Save if we've reached the next checkpoint timestep.
-            if self.ts_since_last_save >= self.save_every_ts:
+            if self.ts_since_last_save >= self.config["save_every_ts"]:
                 self.save(self.agent.cumulative_timesteps)
                 self.ts_since_last_save = 0
 
@@ -400,78 +432,108 @@ class Learner(
         """
 
         # Unpack timestep data.
-        traj_timestep_idx_ranges: List[Tuple[int, int, bool]] = []
-        cur_idx = 0
-        val_net_input = []
+        traj_timestep_idx_ranges: List[Tuple[int, int]] = []
+        start = 0
+        stop = 0
+        val_net_input: List[Tuple[AgentID, ObsType]] = []
         for trajectory in trajectories:
-            includes_final_obs = (
-                trajectory.final_obs is not None and trajectory.truncated is True
-            )
-            traj_timesteps = len(trajectory.complete_timesteps) + includes_final_obs
             val_net_input += [
                 (trajectory.agent_id, obs)
                 for (obs, *_) in trajectory.complete_timesteps
             ]
-            if includes_final_obs:
-                val_net_input.append((trajectory.agent_id, trajectory.final_obs))
-            traj_timestep_idx_ranges.append(
-                (cur_idx, cur_idx + traj_timesteps, includes_final_obs)
-            )
-            cur_idx += traj_timesteps
+            val_net_input.append((trajectory.agent_id, trajectory.final_obs))
+            stop = start + len(val_net_input)
+            traj_timestep_idx_ranges.append((start, stop))
+            start = stop
 
         value_net = self.ppo_learner.value_net
 
         # Predict the expected returns at each state.
         val_preds: torch.Tensor = value_net(val_net_input).cpu().flatten()
         torch.cuda.empty_cache()
-        for idx, (start, stop, includes_final_obs) in enumerate(
-            traj_timestep_idx_ranges
-        ):
-            if includes_final_obs:
-                val_preds_traj = val_preds[start : stop - 1]
-                final_val_pred = val_preds[stop - 1]
-            else:
-                val_preds_traj = val_preds[start:stop]
-                final_val_pred = None
+        for idx, (start, stop) in enumerate(traj_timestep_idx_ranges):
+            val_preds_traj = val_preds[start : stop - 1]
+            final_val_pred = val_preds[stop - 1]
             trajectories[idx].update_val_preds(val_preds_traj, final_val_pred)
 
         # Compute the desired reinforcement learning quantities.
-        ret_std = self.return_stats.std[0] if self.standardize_returns else None
+        ret_std = (
+            self.return_stats.std[0] if self.config["standardize_returns"] else None
+        )
 
-        (
-            observations,
-            actions,
-            log_probs,
-            rewards,
-            terminateds,
-            truncateds,
-            values,
-            advantages,
-            returns,
-        ) = torch_functions.compute_gae(
+        returns = self.add_experience(
             trajectories,
-            gamma=self.gae_gamma,
-            lmbda=self.gae_lambda,
+            gamma=self.config["gae_gamma"],
+            lmbda=self.config["gae_lambda"],
             return_std=ret_std,  # 1 by default if no standardization is requested
         )
 
-        if self.standardize_returns:
+        if self.config["standardize_returns"]:
             # Update the running statistics about the returns.
-            n_to_increment = min(self.max_returns_per_stats_increment, len(returns))
+            n_to_increment = min(
+                self.config["max_returns_per_stats_increment"], len(returns)
+            )
 
             self.return_stats.increment(returns[:n_to_increment], n_to_increment)
 
-        # Add our new experience to the buffer.
+    @torch.no_grad
+    def add_experience(
+        self,
+        trajectories: List[
+            Trajectory[AgentID, ActionType, ObsType, RewardTypeWrapper[RewardType]]
+        ],
+        gamma=0.99,
+        lmbda=0.95,
+        return_std=None,
+    ):
+        """
+        :param experience_buffer: Experience buffer to add to
+        :param trajectories: List of trajectories with value predictions.
+        :param gamma: Gamma hyper-parameter.
+        :param lmbda: Lambda hyper-parameter.
+        :param return_std: Standard deviation of the returns (used for reward normalization).
+        :return: non-bootstrapped returns, for logging purposes
+        """
+        observations: List[Tuple[AgentID, ObsType]] = []
+        actions: List[ActionType] = []
+        log_probs: List[torch.Tensor] = []
+        values: List[float] = []
+        advantages: List[float] = []
+        returns: List[float] = []
+        for trajectory in trajectories:
+            cur_return = torch.as_tensor(0)
+            next_val_pred = (
+                trajectory.final_val_pred
+                if trajectory.truncated
+                else torch.as_tensor(0)
+            )
+            cur_advantages = torch.as_tensor(0)
+            for timestep in reversed(trajectory.complete_timesteps):
+                (obs, action, log_prob, reward, terminated, truncated, val_pred) = (
+                    timestep
+                )
+                reward_tensor = reward.as_tensor()
+                if return_std is not None:
+                    norm_reward_tensor = torch.min(
+                        torch.max(reward_tensor / return_std, -10), 10
+                    )
+                else:
+                    norm_reward_tensor = reward_tensor
+                delta = norm_reward_tensor + gamma * next_val_pred - val_pred
+                next_val_pred = val_pred
+                cur_advantages = delta + gamma * lmbda * cur_advantages
+                cur_return = norm_reward_tensor + gamma * cur_return
+                returns.append(cur_return.detach().item())
+                observations.append((trajectory.agent_id, obs))
+                actions.append(action)
+                log_probs.append(log_prob)
+                values.append(val_pred)
+                advantages.append(cur_advantages)
+
         self.experience_buffer.submit_experience(
-            observations,
-            actions,
-            log_probs,
-            rewards,
-            terminateds,
-            truncateds,
-            values,
-            advantages,
+            observations, actions, log_probs, values, advantages
         )
+        return returns
 
     def save(self, cumulative_timesteps):
         """
@@ -493,9 +555,11 @@ class Learner(
         existing_checkpoints = [
             int(arg) for arg in os.listdir(self.checkpoints_save_folder)
         ]
-        if len(existing_checkpoints) > self.n_checkpoints_to_keep:
+        if len(existing_checkpoints) > self.config["n_checkpoints_to_keep"]:
             existing_checkpoints.sort()
-            for checkpoint_name in existing_checkpoints[: -self.n_checkpoints_to_keep]:
+            for checkpoint_name in existing_checkpoints[
+                : -self.config["n_checkpoints_to_keep"]
+            ]:
                 shutil.rmtree(
                     os.path.join(self.checkpoints_save_folder, str(checkpoint_name))
                 )
@@ -513,7 +577,7 @@ class Learner(
             "ts_since_last_save": self.ts_since_last_save,
             "reward_running_stats": self.return_stats.to_json(),
         }
-        if self.standardize_returns:
+        if self.config["standardize_returns"]:
             book_keeping_vars["reward_running_stats"] = self.return_stats.to_json()
 
         if self.wandb_run is not None:
@@ -557,7 +621,7 @@ class Learner(
             self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
 
             if (
-                self.standardize_returns
+                self.config["standardize_returns"]
                 and "reward_running_stats" in book_keeping_vars.keys()
             ):
                 self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
