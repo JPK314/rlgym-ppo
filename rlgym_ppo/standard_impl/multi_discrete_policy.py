@@ -7,15 +7,18 @@ Description:
     available in Rocket League.
 """
 
+from typing import Iterable, List, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
+from rlgym.api import AgentID
 
 from rlgym_ppo.api import PPOPolicy
 from rlgym_ppo.util import torch_functions
 
 
-class MultiDiscreteFF(PPOPolicy):
+class MultiDiscreteFF(PPOPolicy[AgentID, np.ndarray, np.ndarray]):
     def __init__(self, input_shape, layer_sizes, device):
         super().__init__()
         self.device = device
@@ -37,28 +40,19 @@ class MultiDiscreteFF(PPOPolicy):
         self.splits = bins
         self.multi_discrete = torch_functions.MultiDiscreteRolv(bins)
 
-    def get_output(self, obs):
-        t = type(obs)
-        if t != torch.Tensor:
-            if t != np.array:
-                obs = np.asarray(obs)
-            obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-
+    def get_output(self, obs_list: List[Tuple[AgentID, np.ndarray]]):
+        obs_batch = np.array([o[1] for o in obs_list])
+        obs = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
         policy_output = self.model(obs)
         return policy_output
 
-    def get_action(self, obs, deterministic=False):
-        """
-        Function to get an action and the log of its probability from the policy given an observation.
-        :param obs: Observation to act on.
-        :param deterministic: Whether the action should be chosen deterministically.
-        :return: Chosen action and its logprob.
-        """
-
-        logits = self.get_output(obs)
+    def get_action(
+        self, obs_list, **kwargs
+    ) -> Tuple[Iterable[np.ndarray], torch.Tensor]:
+        logits = self.get_output(obs_list)
 
         # TODO not sure how to do this better - very slow atm
-        if deterministic:
+        if "deterministic" in kwargs and kwargs["deterministic"]:
             start = 0
             action = []
             for split in self.splits:
@@ -73,21 +67,20 @@ class MultiDiscreteFF(PPOPolicy):
         action = distribution.sample()
         log_prob = distribution.log_prob(action)
 
-        return action.cpu(), log_prob.cpu()
+        # returned action shape: (L, 8) where L is the batching dimension (parallel with obs_list)
+        # Returned log prob shape: (L) where L is the batching dimension (parallel with obs_list)
+        return action.cpu().numpy(), log_prob.cpu()
 
-    def get_backprop_data(self, obs, acts):
-        """
-        Function to compute the data necessary for backpropagation.
-        :param obs: Observations to pass through the policy.
-        :param acts: Actions taken by the policy.
-        :return: Action log probs & entropy.
-        """
-        logits = self.get_output(obs)
+    def get_backprop_data(
+        self, obs_list, acts, **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = self.get_output(obs_list)
+        acts_tensor = torch.as_tensor(np.array(acts)).to(self.device)
 
         distribution = self.multi_discrete
         distribution.make_distribution(logits)
 
         entropy = distribution.entropy().to(self.device)
-        log_probs = distribution.log_prob(acts).to(self.device)
+        log_probs = distribution.log_prob(acts_tensor).to(self.device)
 
         return log_probs, entropy.mean()

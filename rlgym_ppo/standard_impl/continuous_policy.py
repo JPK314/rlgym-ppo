@@ -12,17 +12,19 @@ Description:
 """
 
 import functools
+from typing import Iterable, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+from rlgym.api import AgentID
 from torch.distributions import Normal
 
 from rlgym_ppo.api import PPOPolicy
 from rlgym_ppo.util import torch_functions
 
 
-class ContinuousPolicy(PPOPolicy):
+class ContinuousPolicy(PPOPolicy[AgentID, np.ndarray, np.ndarray]):
     def __init__(
         self, input_shape, output_shape, layer_sizes, device, var_min=0.1, var_max=1.0
     ):
@@ -70,55 +72,43 @@ class ContinuousPolicy(PPOPolicy):
 
         return term1 + term2 + term3 + term4
 
-    def get_output(self, obs):
-        if type(obs) != torch.Tensor:
-            if type(obs) != np.array:
-                obs = np.asarray(obs)
-            obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+    def get_output(
+        self, obs_list: List[Tuple[AgentID, np.ndarray]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        obs_batch = np.array([o[1] for o in obs_list])
+        obs = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
 
         policy_output = self.model(obs)
         return self.affine_map(policy_output)
 
-    def get_action(self, obs, summed_probs=True, deterministic=False):
-        """
-        Function to get an action and the log of its probability from the policy given an observation.
-        :param obs: Observation to get an action for.
-        :param summed_probs: Whether the resulting log probabilities should be summed along the final axis. Defaults to true.
-        :param deterministic: Whether an action should be sampled or the mean should be returned instead.
-        :return: An action and its probability.
-        """
-        mean, std = self.get_output(obs)
-        if deterministic:
+    def get_action(
+        self, obs_list, **kwargs
+    ) -> Tuple[Iterable[np.ndarray], torch.Tensor]:
+        mean, std = self.get_output(obs_list)
+        if "deterministic" in kwargs and kwargs["deterministic"]:
             # The probability of a deterministic action occurring is 1 -> log(1) = 0.
-            return mean, 0
+            return mean.cpu().numpy(), torch.zeros(mean.shape)
 
         distribution = Normal(loc=mean, scale=std)
         action = distribution.sample().clamp(min=-1, max=1)
         log_prob = self.logpdf(action, mean, std)
 
         shape = log_prob.shape
-        if summed_probs:
+        if "summed_probs" in kwargs and kwargs["summed_probs"]:
             if len(shape) > 1:
                 log_prob = log_prob.sum(dim=-1)
             else:
                 log_prob = log_prob.sum()
 
-        return action.cpu(), log_prob.cpu()
+        return action.cpu().numpy(), log_prob.cpu()
 
-    def get_backprop_data(self, obs, acts, summed_probs=True):
-        """
-        Function to compute the data necessary for backpropagation.
-        :param obs: Observations to pass through the policy.
-        :param acts: Actions taken by the policy.
-        :param summed_probs: Whether the log probs should be summed along the final dimension. Default True.
-        :return: Action log probs & entropy.
-        """
-
-        mean, std = self.get_output(obs)
+    def get_backprop_data(self, obs_list, acts, **kwargs):
+        mean, std = self.get_output(obs_list)
         distribution = Normal(loc=mean, scale=std)
 
-        prob = self.logpdf(acts, mean, std)
-        if summed_probs:
+        acts_tensor = torch.as_tensor(np.array(acts)).to(self.device)
+        prob = self.logpdf(acts_tensor, mean, std)
+        if kwargs["summed_probs"]:
             log_probs = prob.sum(dim=1).to(self.device)
         else:
             log_probs = prob.to(self.device)

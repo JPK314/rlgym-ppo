@@ -9,14 +9,14 @@ Description:
 """
 
 import time
-from typing import Generic, List
+from typing import Generic, List, Tuple
 
 import numpy as np
 import torch
-from rlgym.api import ActionType, ObsType, RewardType
+from rlgym.api import ActionType, AgentID, ObsType
 
 
-class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
+class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
     @staticmethod
     def _cat(t1, t2, size):
         if len(t2) > size:
@@ -42,8 +42,8 @@ class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
     def __init__(self, max_size, seed, device):
         self.device = device
         self.seed = seed
-        self.observations = torch.FloatTensor().to(self.device)
-        self.actions = torch.FloatTensor().to(self.device)
+        self.observations: List[Tuple[AgentID, ObsType]] = []
+        self.actions: List[ActionType] = []
         self.log_probs = torch.FloatTensor().to(self.device)
         self.rewards = torch.FloatTensor().to(self.device)
         self.terminateds = torch.FloatTensor().to(self.device)
@@ -55,7 +55,7 @@ class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
 
     def submit_experience(
         self,
-        observations: List[ObsType],
+        observations: List[Tuple[AgentID, ObsType]],
         actions: List[ActionType],
         log_probs: List[torch.Tensor],
         rewards: List[torch.Tensor],
@@ -80,16 +80,8 @@ class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
         """
 
         _cat = ExperienceBuffer._cat
-        self.observations = _cat(
-            self.observations,
-            torch.as_tensor(observations, dtype=torch.float32, device=self.device),
-            self.max_size,
-        )
-        self.actions = _cat(
-            self.actions,
-            torch.as_tensor(actions, dtype=torch.float32, device=self.device),
-            self.max_size,
-        )
+        self.observations += observations
+        self.actions += actions
         self.log_probs = _cat(
             self.log_probs,
             torch.as_tensor(log_probs, dtype=torch.float32, device=self.device),
@@ -121,11 +113,17 @@ class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
             self.max_size,
         )
 
-    def _get_samples(self, indices):
+    def _get_samples(self, indices) -> Tuple[
+        List[ActionType],
+        torch.Tensor,
+        List[Tuple[AgentID, ObsType]],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         return (
-            self.actions[indices],
+            [self.actions[index] for index in indices],
             self.log_probs[indices],
-            self.observations[indices],
+            [self.observations[index] for index in indices],
             self.values[indices],
             self.advantages[indices],
         )
@@ -154,7 +152,6 @@ class ExperienceBuffer(Generic[ObsType, ActionType, RewardType]):
         del self.actions
         del self.log_probs
         del self.rewards
-        del self.next_states
         del self.terminateds
         del self.truncateds
         del self.values

@@ -1,6 +1,3 @@
-from typing import Type
-
-import numpy as np
 from rlgym.api import (
     ActionSpaceType,
     ActionType,
@@ -10,26 +7,19 @@ from rlgym.api import (
     RewardType,
 )
 
-from rlgym_ppo.api import (
-    ActionSpaceTypeSerde,
-    ActionTypeSerde,
-    AgentIDSerde,
-    ObsSpaceTypeSerde,
-    ObsTypeSerde,
-    RewardTypeSerde,
-)
+from rlgym_ppo.api import TypeSerde
 from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
 
 
 def batched_agent_process(
     proc_id,
     endpoint,
-    agent_id_serde: Type[AgentIDSerde[AgentID]],
-    action_type_serde: Type[ActionTypeSerde[ActionType]],
-    obs_type_serde: Type[ObsTypeSerde[ObsType]],
-    reward_type_serde: Type[RewardTypeSerde[RewardType]],
-    action_space_type_serde: Type[ActionSpaceTypeSerde[ActionSpaceType]],
-    obs_space_type_serde: Type[ObsSpaceTypeSerde[ObsSpaceType]],
+    agent_id_serde: TypeSerde[AgentID],
+    action_type_serde: TypeSerde[ActionType],
+    obs_type_serde: TypeSerde[ObsType],
+    reward_type_serde: TypeSerde[RewardType],
+    action_space_type_serde: TypeSerde[ActionSpaceType],
+    obs_space_type_serde: TypeSerde[ObsSpaceType],
     shm_buffer,
     shm_offset: int,
     shm_size: int,
@@ -82,7 +72,12 @@ def batched_agent_process(
 
     env = None
     metrics_encoding_function = None
-    shm_view = None
+    shm_view = np.frombuffer(
+        buffer=shm_buffer,
+        dtype=np.byte,
+        offset=shm_offset,
+        count=shm_size,
+    )
 
     POLICY_ACTIONS_HEADER = comm_consts.POLICY_ACTIONS_HEADER
     ENV_SHAPES_HEADER = comm_consts.ENV_SHAPES_HEADER
@@ -119,9 +114,10 @@ def batched_agent_process(
             env = build_env_fn()
 
     reset_obs = env.reset()
-    # ASSUMPTION: AgentID hash is not modified during the course of an episode
     agent_id_ordering = {idx: agent_id for (idx, agent_id) in enumerate(env.agents)}
-    serialized_agent_ids = {agent_id: agent_id.to_bytes() for agent_id in env.agents}
+    serialized_agent_ids = {
+        agent_id: agent_id_serde.to_bytes(agent_id) for agent_id in env.agents
+    }
     prev_serialized_agent_ids = {
         key: value for (key, value) in serialized_agent_ids.items()
     }
@@ -133,24 +129,17 @@ def batched_agent_process(
     obs_buffer = comm_consts.pack_int(n_agents)
     for agent_id, obs in reset_obs.items():
         agent_id_bytes = serialized_agent_ids[agent_id]
-        obs_bytes = obs.to_bytes()
+        obs_bytes = obs_type_serde.to_bytes(obs)
         obs_buffer += comm_consts.pack_int(len(agent_id_bytes))
         obs_buffer += agent_id_bytes
         obs_buffer += comm_consts.pack_int(len(obs_bytes))
         obs_buffer += obs_bytes
 
-    # construct shm_view
-    count = len(obs_buffer)
+    obs_buffer_array = np.frombuffer(obs_buffer, dtype=np.byte)
     assert (
-        count <= shm_size
+        obs_buffer_array.size <= shm_size
     ), "ATTEMPTED TO CREATE AGENT MESSAGE BUFFER LARGER THAN MAXIMUM ALLOWED SIZE"
-    shm_view = np.frombuffer(
-        buffer=shm_buffer,
-        dtype=np.byte,
-        offset=shm_offset,
-        count=count,
-    )
-    shm_view[:] = obs_buffer
+    shm_view[: obs_buffer_array.size] = obs_buffer_array
     packed_message_floats = comm_consts.pack_header(comm_consts.ENV_RESET_STATE_HEADER)
     pipe.sendto(packed_message_floats, endpoint)
 
@@ -164,12 +153,16 @@ def batched_agent_process(
             if header[0] == POLICY_ACTIONS_HEADER[0]:
                 actions_dict = {}
                 for _ in range(n_agents):
-                    (agent_id_bytes, socket_offset) = comm_consts.retrieve_bytes(
-                        socket_data, socket_offset
+                    (agent_id_bytes, socket_offset) = (
+                        comm_consts.retrieve_bytes_from_message(
+                            socket_data, socket_offset
+                        )
                     )
                     agent_id = agent_id_serde.from_bytes(agent_id_bytes)
-                    (action_bytes, socket_offset) = comm_consts.retrieve_bytes(
-                        socket_data, socket_offset
+                    (action_bytes, socket_offset) = (
+                        comm_consts.retrieve_bytes_from_message(
+                            socket_data, socket_offset
+                        )
                     )
                     action = action_type_serde.from_bytes(action_bytes)
                     actions_dict[agent_id] = action
@@ -287,7 +280,7 @@ def batched_agent_process(
                         offset = comm_consts.append_bytes(
                             shm_view,
                             offset,
-                            agent_id_serde.to_bytes(obs_dict[agent_id]),
+                            obs_type_serde.to_bytes(obs_dict[agent_id]),
                             shm_size,
                         )
                         offset = comm_consts.append_bytes(
@@ -339,8 +332,8 @@ def batched_agent_process(
                         time.sleep(0.1)
 
             elif header[0] == ENV_SHAPES_HEADER[0]:
-                obs_space = env.observation_spaces.values()[0]
-                action_space = env.action_spaces.values()[0]
+                obs_space = list(env.observation_spaces.values())[0]
+                action_space = list(env.action_spaces.values())[0]
 
                 # Print out the environment shapes and action space type.
                 print("Received request for env shapes, returning:")

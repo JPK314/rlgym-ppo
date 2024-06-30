@@ -157,3 +157,9 @@ cython_debug/
 rlgym-ppo.code-workspace
 .vscode/settings.json
 *.code-workspace
+
+# vscode config
+/.vscode
+
+# testing data
+/data

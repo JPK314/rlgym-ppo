@@ -7,13 +7,13 @@ Description:
 
 """
 
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-from rlgym.api import ActionType, ObsType, RewardType
+from rlgym.api import ActionType, AgentID, ObsType, RewardType
 
-from rlgym_ppo.api import ActionType, AgentID, ObsType, RewardType, RewardTypeWrapper
+from rlgym_ppo.api import RewardTypeWrapper
 from rlgym_ppo.batched_agents import Trajectory
 
 
@@ -57,7 +57,7 @@ def compute_gae(
     :param return_std: Standard deviation of the returns (used for reward normalization).
     :return: Bootstrapped value function estimates, GAE results, returns.
     """
-    observations: List[ObsType] = []
+    observations: List[Tuple[AgentID, ObsType]] = []
     actions: List[ActionType] = []
     log_probs: List[torch.Tensor] = []
     rewards: List[torch.Tensor] = []
@@ -67,9 +67,14 @@ def compute_gae(
     advantages: List[float] = []
     returns: List[float] = []
     for trajectory in trajectories:
-        cur_return = trajectory.final_val_pred
-        next_val_pred = trajectory.final_val_pred
-        cur_advantages = torch.Tensor(0)
+        final_val_pred = (
+            trajectory.final_val_pred
+            if trajectory.final_val_pred is not None
+            else torch.as_tensor(0)
+        )
+        cur_return = final_val_pred
+        next_val_pred = final_val_pred.detach().clone()
+        cur_advantages = torch.as_tensor(0)
         for timestep in reversed(trajectory.complete_timesteps):
             (obs, action, log_prob, reward, terminated, truncated, val_pred) = timestep
             reward_tensor = reward.as_tensor()
@@ -78,7 +83,7 @@ def compute_gae(
             cur_advantages = delta + gamma * lmbda * cur_advantages
             cur_return = reward_tensor + gamma * cur_return
             returns.append(cur_return.detach().item())
-            observations.append(obs)
+            observations.append((trajectory.agent_id, obs))
             actions.append(action)
             log_probs.append(log_prob)
             rewards.append(reward_tensor)
@@ -137,7 +142,7 @@ class MultiDiscreteRolv(nn.Module):
         # Construct a distribution with our fixed logits.
         self.distribution = torch.distributions.Categorical(logits=logits)
 
-    def log_prob(self, action):
+    def log_prob(self, action) -> torch.Tensor:
         return self.distribution.log_prob(action).sum(dim=-1)
 
     def sample(self):

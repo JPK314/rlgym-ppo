@@ -13,23 +13,13 @@ import pickle
 import selectors
 import socket
 import time
-from typing import Callable, Dict, Generic, Type, Union
+from typing import Callable, Dict, Generic
 
 import numpy as np
 import torch
-from numpy import frombuffer, prod
+from numpy import frombuffer
 
-from rlgym_ppo.api import (
-    ActionSpaceTypeSerde,
-    ActionTypeSerde,
-    ActorCriticManager,
-    AgentIDSerde,
-    ObsSpaceTypeSerde,
-    ObsTypeSerde,
-    PPOPolicy,
-    RewardTypeSerde,
-    ValueNet,
-)
+from rlgym_ppo.api import ActorCriticManager, PPOPolicy, TypeSerde, ValueNet
 from rlgym_ppo.batched_agents import BatchedTrajectory, Trajectory, comm_consts
 from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
 from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
@@ -85,15 +75,14 @@ class BatchedAgentManager(
             ],
         ],
         actor_critic_manager: ActorCriticManager,
-        agent_id_serde: Type[AgentIDSerde[AgentID]],
-        action_type_serde: Type[ActionTypeSerde[ActionType]],
-        obs_type_serde: Type[ObsTypeSerde[ObsType]],
-        reward_type_serde: Type[RewardTypeSerde[RewardType]],
-        obs_space_type_serde: Type[ObsSpaceTypeSerde[ObsSpaceType]],
-        action_space_type_serde: Type[ActionSpaceTypeSerde[ActionSpaceType]],
+        agent_id_serde: TypeSerde[AgentID],
+        action_type_serde: TypeSerde[ActionType],
+        obs_type_serde: TypeSerde[ObsType],
+        reward_type_serde: TypeSerde[RewardType],
+        obs_space_type_serde: TypeSerde[ObsSpaceType],
+        action_space_type_serde: TypeSerde[ActionSpaceType],
         min_inference_size=8,
         seed=123,
-        standardize_obs=True,
         steps_per_obs_stats_increment=5,
         recalculate_agent_id_every_step=False,
     ):
@@ -121,7 +110,6 @@ class BatchedAgentManager(
         self.cumulative_timesteps = 0
         self.min_inference_size = min_inference_size
 
-        self.standardize_obs = standardize_obs
         self.steps_per_obs_stats_increment = steps_per_obs_stats_increment
         self.steps_since_obs_stats_update = 0
 
@@ -252,7 +240,7 @@ class BatchedAgentManager(
                     self.action_type_serde.to_bytes(action)
                 )
             assert (
-                len(actions_bytes) > PACKET_MAX_SIZE
+                len(actions_bytes) < PACKET_MAX_SIZE
             ), "ACTIONS BYTES TOO LARGE TO SEND VIA SOCKET"
             # TODO: is it worth using shm? Kind of concerned about synchronicity and the upside seems small (test speed?)
             parent_end.sendto(actions_bytes, child_endpoint)
@@ -437,12 +425,12 @@ class BatchedAgentManager(
             socket_data = parent_end.recv(PACKET_MAX_SIZE)
             (header, socket_offset) = comm_consts.unpack_header(socket_data)
             if header == comm_consts.ENV_SHAPES_HEADER:
-                (obs_space_bytes, socket_offset) = comm_consts.retrieve_bytes(
-                    socket_data, socket_offset
+                (obs_space_bytes, socket_offset) = (
+                    comm_consts.retrieve_bytes_from_message(socket_data, socket_offset)
                 )
                 obs_space = self.obs_space_type_serde.from_bytes(obs_space_bytes)
-                (action_space_bytes, socket_offset) = comm_consts.retrieve_bytes(
-                    socket_data, socket_offset
+                (action_space_bytes, socket_offset) = (
+                    comm_consts.retrieve_bytes_from_message(socket_data, socket_offset)
                 )
                 action_space = self.action_space_type_serde.from_bytes(
                     action_space_bytes
@@ -454,9 +442,11 @@ class BatchedAgentManager(
     def init_processes(
         self,
         policy_factory: Callable[
-            [ObsSpaceType, ActionSpaceType], PPOPolicy[AgentID, ObsType, ActionType]
+            [ObsSpaceType, ActionSpaceType, str],
+            PPOPolicy[AgentID, ObsType, ActionType],
         ],
-        value_net_factory: Callable[[ObsSpaceType], ValueNet[AgentID, ObsType]],
+        value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
+        device: str,
         n_processes: int,
         collect_metrics_fn=None,
         spawn_delay=None,
@@ -508,7 +498,7 @@ class BatchedAgentManager(
             parent_end = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             parent_end.bind(("127.0.0.1", 0))
 
-            shm_offset = proc_id * self.shm_size * 4
+            shm_offset = proc_id * self.shm_size
 
             process = context.Process(
                 target=batched_agent_process,
@@ -519,6 +509,8 @@ class BatchedAgentManager(
                     self.action_type_serde,
                     self.obs_type_serde,
                     self.reward_type_serde,
+                    self.action_space_type_serde,
+                    self.obs_space_type_serde,
                     self.shm_buffer,
                     shm_offset,
                     self.shm_size,
@@ -532,7 +524,7 @@ class BatchedAgentManager(
 
             shm_view = frombuffer(
                 buffer=self.shm_buffer,
-                dtype=np.float32,
+                dtype=np.byte,
                 offset=shm_offset,
                 count=self.shm_size,
             )
@@ -560,8 +552,8 @@ class BatchedAgentManager(
 
         self._get_initial_obs()
         (obs_space, action_space) = self._get_space_types()
-        self.policy = policy_factory(obs_space, action_space)
-        return (self.policy, value_net_factory(obs_space))
+        self.policy = policy_factory(obs_space, action_space, device)
+        return (self.policy, value_net_factory(obs_space, device))
 
     def cleanup(self):
         """

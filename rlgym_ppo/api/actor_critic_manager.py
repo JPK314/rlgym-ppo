@@ -7,7 +7,7 @@ from rlgym.api import AgentID
 class ActorCriticManager(Generic[AgentID]):
 
     @abstractmethod
-    def should_discard(agent_id: AgentID) -> bool:
+    def should_discard(self, agent_id: AgentID) -> bool:
         """
         :agent_id: AgentID instance used to determine whether the associated trajectory should be discarded.
         :return: true if trajectory should be discarded, false otherwise.

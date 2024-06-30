@@ -7,7 +7,6 @@ from torch import Tensor
 
 class RewardTypeWrapper(Generic[RewardType]):
     def __init__(self, reward: RewardType):
-        super().__init__()
         self.reward = reward
 
     def __getattr__(self, name):
@@ -15,4 +14,9 @@ class RewardTypeWrapper(Generic[RewardType]):
 
     @abstractmethod
     def as_tensor(self) -> Tensor:
+        """
+        Transform this instance into a tensor, for the purposes of calculating
+        returns and advantages.
+        :return: Tensor. Must be 0-dimensional for PPO.
+        """
         raise NotImplementedError

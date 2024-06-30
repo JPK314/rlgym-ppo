@@ -11,8 +11,9 @@ class ValueNet(nn.Module, Generic[AgentID, ObsType]):
         super().__init__()
 
     @abstractmethod
-    def forward(self, obs_list: List[Tuple[AgentID, ObsType]]) -> Tuple[Tensor, Tensor]:
+    def forward(self, obs_list: List[Tuple[AgentID, ObsType]]) -> Tensor:
         """
         :obs_list: list of agent_id and obs pairs to potentially compute values for.
+        :return: Tensor. Must be 0-dimensional for PPO.
         """
         raise NotImplementedError

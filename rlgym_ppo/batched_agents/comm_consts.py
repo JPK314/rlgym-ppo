@@ -37,30 +37,39 @@ def pack_bytes(data: bytes):
 
 
 def append_bytes(array: np.ndarray, offset: int, data: bytes, max_offset: int):
-    size = len(data)
-    _overload_check(offset, size, max_offset)
-    array[offset : offset + INTEGER_SIZE] = pack_int(size)
-    offset += INTEGER_SIZE
-    end = offset + size
-    array[offset:end] = data
+    data_array = np.frombuffer(data, dtype=np.byte)
+    _overload_check(offset, data_array.size + INTEGER_SIZE, max_offset)
+    offset = append_int(array, offset, data_array.size, max_offset)
+    end = offset + data_array.size
+    array[offset:end] = data_array
     return end
 
 
-def retrieve_bytes(array: Union[np.ndarray, bytes], offset: int) -> Tuple[bytes, int]:
+def retrieve_bytes(array: np.ndarray, offset: int) -> Tuple[bytes, int]:
     (size, offset) = retrieve_int(array, offset)
-    return (offset + size, array[offset : offset + size])
+    return (array[offset : offset + size].tobytes(), offset + size)
+
+
+def retrieve_bytes_from_message(array: bytes, offset: int) -> Tuple[bytes, int]:
+    (size, offset) = retrieve_int_from_message(array, offset)
+    return (array[offset : offset + size], offset + size)
 
 
 def append_int(array: np.ndarray, offset: int, data: int, max_offset: int):
     _overload_check(offset, INTEGER_SIZE, max_offset)
     end = offset + INTEGER_SIZE
-    array[offset:end] = pack_int(data)
+    array[offset:end] = np.frombuffer(pack_int(data), dtype=np.byte)
     return end
 
 
-def retrieve_int(
-    array: Union[np.ndarray, bytes], offset, endian="="
-) -> Tuple[int, int]:
+def retrieve_int(array: np.ndarray, offset, endian="=") -> Tuple[int, int]:
+    return (
+        struct.unpack(endian + "I", array[offset : offset + INTEGER_SIZE].tobytes())[0],
+        offset + INTEGER_SIZE,
+    )
+
+
+def retrieve_int_from_message(array: bytes, offset, endian="=") -> Tuple[int, int]:
     return (
         struct.unpack(endian + "I", array[offset : offset + INTEGER_SIZE])[0],
         offset + INTEGER_SIZE,
@@ -70,15 +79,13 @@ def retrieve_int(
 def append_bool(array: np.ndarray, offset: int, data: bool, max_offset: int):
     _overload_check(offset, BOOL_SIZE, max_offset)
     end = offset + BOOL_SIZE
-    array[offset:end] = pack_bool(data)
+    array[offset:end] = np.frombuffer(pack_bool(data), dtype=np.byte)
     return end
 
 
-def retrieve_bool(
-    array: Union[np.ndarray, bytes], offset, endian="="
-) -> Tuple[int, int]:
+def retrieve_bool(array: np.ndarray, offset, endian="=") -> Tuple[int, int]:
     return (
-        struct.unpack(endian + "?", array[offset : offset + BOOL_SIZE])[0],
+        struct.unpack(endian + "?", array[offset : offset + BOOL_SIZE].tobytes())[0],
         offset + BOOL_SIZE,
     )
 

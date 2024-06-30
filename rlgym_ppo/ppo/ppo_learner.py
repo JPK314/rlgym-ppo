@@ -15,7 +15,7 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
     def __init__(
         self,
         policy: PPOPolicy[AgentID, ObsType, ActionType],
-        value_net: ValueNet[ObsType],
+        value_net: ValueNet[AgentID, ObsType],
         batch_size,
         n_epochs,
         policy_lr,
@@ -70,7 +70,7 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         self.ent_coef = ent_coef
         self.cumulative_model_updates = 0
 
-    def learn(self, exp: ExperienceBuffer):
+    def learn(self, exp: ExperienceBuffer[AgentID, ObsType, ActionType]):
         """
         Compute PPO updates with an experience buffer.
 
@@ -108,7 +108,6 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                     batch_values,
                     batch_advantages,
                 ) = batch
-                batch_acts = batch_acts.view(self.batch_size, -1)
                 batch_target_values = batch_values + batch_advantages
                 self.policy_optimizer.zero_grad()
                 self.value_optimizer.zero_grad()
@@ -118,8 +117,8 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                     start = minibatch_slice
                     stop = start + self.mini_batch_size
 
-                    acts = batch_acts[start:stop].to(self.device)
-                    obs = batch_obs[start:stop].to(self.device)
+                    acts = batch_acts[start:stop]
+                    obs = batch_obs[start:stop]
                     advantages = batch_advantages[start:stop].to(self.device)
                     old_probs = batch_old_probs[start:stop].to(self.device)
                     target_values = batch_target_values[start:stop].to(self.device)

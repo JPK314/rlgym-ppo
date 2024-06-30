@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Generic, List, Tuple
+from typing import Generic, Iterable, List, Tuple
 
 import torch.nn as nn
 from rlgym.api import ActionType, AgentID, ObsType
@@ -13,22 +13,23 @@ class PPOPolicy(nn.Module, Generic[AgentID, ObsType, ActionType]):
 
     @abstractmethod
     def get_action(
-        self, obs: List[Tuple[AgentID, ObsType]], deterministic=False
-    ) -> Tuple[List[ActionType], List[Tensor]]:
+        self, obs_list: List[Tuple[AgentID, ObsType]], **kwargs
+    ) -> Tuple[Iterable[ActionType], Tensor]:
         """
         Function to get an action and the log of its probability from the policy given an observation.
         :param obs_list: list of tuples of agent IDs and observations parallel with returned list. Agent IDs may not be unique here.
-        :param deterministic: Whether the action should be chosen deterministically.
-        :return: Tuple of lists of chosen action and its logprob, each parallel with obs_list.
+        :return: Tuple of lists of chosen action and Tensor, with the action list and the first dimension of the tensor parallel with obs_list.
         """
         raise NotImplementedError
 
     @abstractmethod
-    def get_backprop_data(self, obs: List[ObsType], acts: List[ActionType]):
+    def get_backprop_data(
+        self, obs_list: List[Tuple[AgentID, ObsType]], acts: List[ActionType], **kwargs
+    ) -> Tuple[Tensor, Tensor]:
         """
         Function to compute the data necessary for backpropagation.
-        :param obs: Observations to pass through the policy.
-        :param acts: Actions taken by the policy.
-        :return: Action log probs & entropy.
+        :param obs_list: list of tuples of agent IDs and obs to pass through the policy
+        :param acts: Actions taken by the policy, parallel with obs_list
+        :return: (Action log probs tensor with first dimension parallel with acts, mean entropy as 0-dimensional tensor).
         """
         raise NotImplementedError

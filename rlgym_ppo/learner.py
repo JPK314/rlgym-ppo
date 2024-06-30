@@ -13,7 +13,7 @@ import os
 import random
 import shutil
 import time
-from typing import Callable, Generic, List, Tuple, Type, Union
+from typing import Callable, Generic, List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
@@ -33,15 +33,11 @@ from rlgym.api import (
 from wandb.wandb_run import Run
 
 from rlgym_ppo.api import (
-    ActionSpaceTypeSerde,
-    ActionTypeSerde,
     ActorCriticManager,
-    AgentIDSerde,
-    ObsSpaceTypeSerde,
-    ObsTypeSerde,
+    MetricsLogger,
     PPOPolicy,
-    RewardTypeSerde,
     RewardTypeWrapper,
+    TypeSerde,
     ValueNet,
 )
 from rlgym_ppo.batched_agents import BatchedAgentManager, Trajectory
@@ -77,17 +73,18 @@ class Learner(
             ],
         ],
         actor_critic_manager: ActorCriticManager,
-        agent_id_serde: Type[AgentIDSerde[AgentID]],
-        action_type_serde: Type[ActionTypeSerde[ActionType]],
-        obs_type_serde: Type[ObsTypeSerde[ObsType]],
-        reward_type_serde: Type[RewardTypeSerde[RewardTypeWrapper[RewardType]]],
-        obs_space_type_serde: Type[ObsSpaceTypeSerde[ObsSpaceType]],
-        action_space_type_serde: Type[ActionSpaceTypeSerde[ActionSpaceType]],
+        agent_id_serde: TypeSerde[AgentID],
+        action_type_serde: TypeSerde[ActionType],
+        obs_type_serde: TypeSerde[ObsType],
+        reward_type_serde: TypeSerde[RewardTypeWrapper[RewardType]],
+        obs_space_type_serde: TypeSerde[ObsSpaceType],
+        action_space_type_serde: TypeSerde[ActionSpaceType],
         policy_factory: Callable[
-            [ObsSpaceType, ActionSpaceType], PPOPolicy[AgentID, ObsType, ActionType]
+            [ObsSpaceType, ActionSpaceType, str],
+            PPOPolicy[AgentID, ObsType, ActionType],
         ],
-        value_net_factory: Callable[[ObsSpaceType], ValueNet[ObsType]],
-        metrics_logger=None,  # TODO: figure out typing for this
+        value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
+        metrics_logger: Optional[MetricsLogger[StateType]] = None,
         n_proc: int = 8,
         min_inference_size: int = 80,
         render: bool = False,
@@ -96,7 +93,6 @@ class Learner(
         exp_buffer_size: int = 100000,
         ts_per_iteration: int = 50000,
         standardize_returns: bool = True,
-        standardize_obs: bool = True,
         max_returns_per_stats_increment: int = 150,
         steps_per_obs_stats_increment: int = 5,
         ppo_epochs: int = 10,
@@ -169,8 +165,8 @@ class Learner(
         self.return_stats = WelfordRunningStat(1)
         self.epoch = 0
 
-        self.experience_buffer = ExperienceBuffer(
-            self.exp_buffer_size, seed=random_seed, device="cpu"
+        self.experience_buffer: ExperienceBuffer[AgentID, ObsType, ActionType] = (
+            ExperienceBuffer(self.exp_buffer_size, seed=random_seed, device="cpu")
         )
 
         print("Initializing processes...")
@@ -188,13 +184,13 @@ class Learner(
             action_space_type_serde,
             min_inference_size=min_inference_size,
             seed=random_seed,
-            standardize_obs=standardize_obs,
             steps_per_obs_stats_increment=steps_per_obs_stats_increment,
             recalculate_agent_id_every_step=recalculate_agent_id_every_step,
         )
         (policy, value_net) = self.agent.init_processes(
             policy_factory=policy_factory,
             value_net_factory=value_net_factory,
+            device=self.device,
             n_processes=n_proc,
             collect_metrics_fn=collect_metrics_fn,
             spawn_delay=instance_launch_delay,
@@ -228,7 +224,6 @@ class Learner(
             "exp_buffer_size": exp_buffer_size,
             "ts_per_iteration": ts_per_iteration,
             "standardize_returns": standardize_returns,
-            "standardize_obs": standardize_obs,
             "ppo_epochs": ppo_epochs,
             "ppo_batch_size": ppo_batch_size,
             "ppo_minibatch_size": ppo_minibatch_size,
@@ -410,7 +405,7 @@ class Learner(
         val_net_input = []
         for trajectory in trajectories:
             includes_final_obs = (
-                trajectory.final_obs is not None and trajectory.truncated
+                trajectory.final_obs is not None and trajectory.truncated is True
             )
             traj_timesteps = len(trajectory.complete_timesteps) + includes_final_obs
             val_net_input += [
@@ -427,10 +422,7 @@ class Learner(
         value_net = self.ppo_learner.value_net
 
         # Predict the expected returns at each state.
-        # TODO: can I use grad here to avoid needing to recalculate value preds in ppo learner for critic update?
-        val_preds: List[torch.Tensor] = (
-            value_net(val_net_input).cpu().flatten().tolist()
-        )
+        val_preds: torch.Tensor = value_net(val_net_input).cpu().flatten()
         torch.cuda.empty_cache()
         for idx, (start, stop, includes_final_obs) in enumerate(
             traj_timestep_idx_ranges
@@ -521,8 +513,6 @@ class Learner(
             "ts_since_last_save": self.ts_since_last_save,
             "reward_running_stats": self.return_stats.to_json(),
         }
-        if self.agent.standardize_obs:
-            book_keeping_vars["obs_running_stats"] = self.agent.obs_stats.to_json()
         if self.standardize_returns:
             book_keeping_vars["reward_running_stats"] = self.return_stats.to_json()
 
@@ -566,12 +556,6 @@ class Learner(
             ]
             self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
 
-            if (
-                self.agent.standardize_obs
-                and "obs_running_stats" in book_keeping_vars.keys()
-            ):
-                self.agent.obs_stats = WelfordRunningStat(1)
-                self.agent.obs_stats.from_json(book_keeping_vars["obs_running_stats"])
             if (
                 self.standardize_returns
                 and "reward_running_stats" in book_keeping_vars.keys()
