@@ -35,6 +35,7 @@ import wandb
 from rlgym_ppo.api import (
     ActorCriticManager,
     MetricsLogger,
+    ObsStandardizer,
     PPOPolicy,
     RewardTypeWrapper,
     TypeSerde,
@@ -55,7 +56,6 @@ class LearnerConfig(TypedDict):
     ts_per_iteration: int
     standardize_returns: bool
     max_returns_per_stats_increment: int
-    steps_per_obs_stats_increment: int
     ppo_epochs: int
     ppo_batch_size: int
     ppo_minibatch_size: Optional[int]
@@ -67,7 +67,6 @@ class LearnerConfig(TypedDict):
     critic_lr: float
     log_to_wandb: bool
     load_wandb: bool
-    wandb_run: Optional[Run]
     wandb_project_name: Optional[str]
     wandb_group_name: Optional[str]
     wandb_run_name: Optional[str]
@@ -93,7 +92,6 @@ DEFAULT_CONFIG: LearnerConfig = {
     "ts_per_iteration": 50000,
     "standardize_returns": True,
     "max_returns_per_stats_increment": 150,
-    "steps_per_obs_stats_increment": 5,
     "ppo_epochs": 10,
     "ppo_batch_size": 50000,
     "ppo_minibatch_size": None,
@@ -105,7 +103,6 @@ DEFAULT_CONFIG: LearnerConfig = {
     "critic_lr": 3e-4,
     "log_to_wandb": False,
     "load_wandb": True,
-    "wandb_run": None,
     "wandb_project_name": None,
     "wandb_group_name": None,
     "wandb_run_name": None,
@@ -161,7 +158,9 @@ class Learner(
             PPOPolicy[AgentID, ObsType, ActionType],
         ],
         value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
+        obs_standardizer: Optional[ObsStandardizer] = None,
         metrics_logger: Optional[MetricsLogger[StateType]] = None,
+        wandb_run: Optional[Run] = None,
         config: LearnerConfig = {},
     ):
         self.config: LearnerConfig = {**DEFAULT_CONFIG, **config}
@@ -222,9 +221,9 @@ class Learner(
             reward_type_serde,
             obs_space_type_serde,
             action_space_type_serde,
+            obs_standardizer=obs_standardizer,
             min_inference_size=self.config["min_inference_size"],
             seed=self.config["random_seed"],
-            steps_per_obs_stats_increment=self.config["steps_per_obs_stats_increment"],
             recalculate_agent_id_every_step=self.config[
                 "recalculate_agent_id_every_step"
             ],
@@ -284,7 +283,7 @@ class Learner(
                 "critic_lr",
             ]
         }
-        self.wandb_run = self.config["wandb_run"]
+        self.wandb_run = wandb_run
         wandb_loaded = self.config["checkpoint_load_folder"] is not None and self.load(
             self.config["checkpoint_load_folder"],
             self.config["load_wandb"],
@@ -292,11 +291,7 @@ class Learner(
             self.config["critic_lr"],
         )
 
-        if (
-            self.config["log_to_wandb"]
-            and self.config["wandb_run"] is None
-            and not wandb_loaded
-        ):
+        if self.config["log_to_wandb"] and self.wandb_run is None and not wandb_loaded:
             project = (
                 "rlgym-ppo"
                 if self.config["wandb_project_name"] is None
@@ -509,8 +504,8 @@ class Learner(
             n_to_increment = min(
                 self.config["max_returns_per_stats_increment"], len(returns)
             )
-
-            self.return_stats.increment(returns[:n_to_increment], n_to_increment)
+            for sample in returns[:n_to_increment]:
+                self.return_stats.update(sample)
 
     @torch.no_grad
     def add_experience(
@@ -693,7 +688,7 @@ class Learner(
         :return: None.
         """
 
-        if self.config["wandb_run"] is not None:
+        if self.wandb_run is not None:
             self.wandb_run.finish()
         if type(self.agent) == BatchedAgentManager:
             self.agent.cleanup()

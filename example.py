@@ -14,6 +14,7 @@ from rlgym_ppo.standard_impl import (
     FloatRewardTypeWrapper,
     FloatSerde,
     NumpyDynamicShapeSerde,
+    NumpyObsStandardizer,
     RewardFunctionWrapper,
     RewardTypeWrapperSerde,
     StrIntTupleSerde,
@@ -218,6 +219,7 @@ if __name__ == "__main__":
         action_space_type_serde=StrIntTupleSerde(),
         policy_factory=policy_factory,
         value_net_factory=value_net_factory,
+        obs_standardizer=NumpyObsStandardizer(5),
         metrics_logger=ExampleLogger(),
         config=config,
     )

@@ -1,6 +1,7 @@
 from .actor_critic_manager import BasicActorCriticManager
 from .continuous_policy import ContinuousPolicy
 from .discrete_policy import DiscreteFF
+from .misc import NumpyObsStandardizer
 from .multi_discrete_policy import MultiDiscreteFF
 from .serdes import (
     BoolSerde,

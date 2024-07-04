@@ -19,7 +19,13 @@ import numpy as np
 import torch
 from numpy import frombuffer
 
-from rlgym_ppo.api import ActorCriticManager, PPOPolicy, TypeSerde, ValueNet
+from rlgym_ppo.api import (
+    ActorCriticManager,
+    ObsStandardizer,
+    PPOPolicy,
+    TypeSerde,
+    ValueNet,
+)
 from rlgym_ppo.batched_agents import BatchedTrajectory, Trajectory, comm_consts
 from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
 from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
@@ -81,9 +87,9 @@ class BatchedAgentManager(
         reward_type_serde: TypeSerde[RewardType],
         obs_space_type_serde: TypeSerde[ObsSpaceType],
         action_space_type_serde: TypeSerde[ActionSpaceType],
+        obs_standardizer: Optional[ObsStandardizer[AgentID, ObsType]] = None,
         min_inference_size=8,
         seed=123,
-        steps_per_obs_stats_increment=5,
         recalculate_agent_id_every_step=False,
     ):
         self.seed = seed
@@ -100,6 +106,7 @@ class BatchedAgentManager(
         self.obs_space_type_serde = obs_space_type_serde
 
         self.actor_critic_manager = actor_critic_manager
+        self.obs_standardizer = obs_standardizer
 
         self.current_obs: List[Dict[AgentID, ObsType]] = []
         self.current_actions: List[Dict[AgentID, ActionType]] = []
@@ -108,9 +115,6 @@ class BatchedAgentManager(
         self.current_pids: List[int] = []
         self.cumulative_timesteps = 0
         self.min_inference_size = min_inference_size
-
-        self.steps_per_obs_stats_increment = steps_per_obs_stats_increment
-        self.steps_since_obs_stats_update = 0
 
         self.trajectory_map: List[BatchedTrajectory] = []
         self.prev_time = 0
@@ -354,6 +358,14 @@ class BatchedAgentManager(
 
         if proc_id not in self.current_pids:
             self.current_pids.append(proc_id)
+
+        if self.obs_standardizer is not None:
+            obs_dict = {
+                agent_id: obs
+                for (agent_id, obs) in self.obs_standardizer.standardize(
+                    list(obs_dict.items())
+                )
+            }
 
         if new_episode:
             self.trajectory_map[proc_id].add_timesteps(

@@ -2,9 +2,17 @@ from typing import Type
 
 import numpy as np
 import torch
-from rlgym.api import AgentID, RewardFunction, RewardType, StateType
+from rlgym.api import (
+    ActionType,
+    AgentID,
+    ObsType,
+    RewardFunction,
+    RewardType,
+    StateType,
+)
 
-from rlgym_ppo.api import RewardTypeWrapper
+from rlgym_ppo.api import PPOPolicy, RewardTypeWrapper
+from rlgym_ppo.util import WelfordRunningStat
 
 
 class FloatRewardTypeWrapper(RewardTypeWrapper[float]):
