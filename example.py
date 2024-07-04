@@ -1,7 +1,9 @@
-from typing import Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
+from rlgym.api import AgentID, RewardFunction
 from rlgym.rocket_league.api import GameState
+from rlgym.rocket_league.common_values import CAR_MAX_SPEED
 from rlgym.rocket_league.obs_builders import DefaultObs
 
 from rlgym_ppo.api import MetricsLogger
@@ -11,7 +13,6 @@ from rlgym_ppo.standard_impl import (
     DiscreteFF,
     FloatRewardTypeWrapper,
     FloatSerde,
-    IntSerde,
     NumpyDynamicShapeSerde,
     RewardFunctionWrapper,
     RewardTypeWrapperSerde,
@@ -71,6 +72,35 @@ class CustomObs(DefaultObs):
         return obs
 
 
+class VelocityPlayerToBallReward(RewardFunction[AgentID, GameState, float]):
+    def reset(
+        self,
+        agents: List[AgentID],
+        initial_state: GameState,
+        shared_info: Dict[str, Any],
+    ) -> None:
+        pass
+
+    def get_rewards(
+        self,
+        agents: List[AgentID],
+        state: GameState,
+        is_terminated: Dict[AgentID, bool],
+        is_truncated: Dict[AgentID, bool],
+        shared_info: Dict[str, Any],
+    ) -> Dict[AgentID, float]:
+        return {agent: self._get_reward(agent, state) for agent in agents}
+
+    def _get_reward(self, agent: AgentID, state: GameState):
+        ball = state.ball
+        car = state.cars[agent].physics
+
+        car_to_ball = ball.position - car.position
+        car_to_ball = car_to_ball / np.linalg.norm(car_to_ball)
+
+        return np.dot(car_to_ball, car.linear_velocity) / CAR_MAX_SPEED
+
+
 def policy_factory(
     obs_space: Tuple[str, int], action_space: Tuple[str, int], device: str
 ):
@@ -119,7 +149,8 @@ def env_create_function():
     rewards_and_weights = (goal_reward_and_weight, touch_reward_and_weight)
 
     reward_fn = RewardFunctionWrapper(
-        CombinedReward(*rewards_and_weights), FloatRewardTypeWrapper
+        CombinedReward((TouchReward(), 1), (VelocityPlayerToBallReward(), 0.1)),
+        FloatRewardTypeWrapper,
     )
 
     obs_builder = CustomObs(
@@ -153,14 +184,29 @@ def env_create_function():
 
 
 if __name__ == "__main__":
-    from rlgym_ppo import Learner
+    from rlgym_ppo import Learner, LearnerConfig
 
     # 32 processes
-    n_proc = 4
+    n_proc = 64
 
     # educated guess - could be slightly higher or lower
     min_inference_size = max(1, int(round(n_proc * 0.9)))
-
+    config: LearnerConfig = {
+        "n_proc": n_proc,
+        "min_inference_size": min_inference_size,
+        "ppo_batch_size": 50000,
+        "ts_per_iteration": 50000,
+        "exp_buffer_size": 150000,
+        "ppo_minibatch_size": 50000,
+        "ppo_ent_coef": 0.001,
+        "ppo_epochs": 1,
+        "standardize_returns": True,
+        "save_every_ts": 100000,
+        "timestep_limit": 1000000000,
+        "log_to_wandb": True,
+        "wandb_group_name": "rlgym-ppo-testing",
+        "render": False,
+    }
     learner = Learner(
         env_create_function=env_create_function,
         actor_critic_manager=BasicActorCriticManager(),
@@ -173,18 +219,6 @@ if __name__ == "__main__":
         policy_factory=policy_factory,
         value_net_factory=value_net_factory,
         metrics_logger=ExampleLogger(),
-        n_proc=n_proc,
-        min_inference_size=min_inference_size,
-        ppo_batch_size=50000,
-        ts_per_iteration=50000,
-        exp_buffer_size=150000,
-        ppo_minibatch_size=50000,
-        ppo_ent_coef=0.001,
-        ppo_epochs=1,
-        standardize_returns=True,
-        save_every_ts=100_000,
-        timestep_limit=1_000_000_000,
-        log_to_wandb=False,
-        render=False,
+        config=config,
     )
     learner.learn()

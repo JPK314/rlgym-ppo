@@ -9,7 +9,7 @@ from rlgym_ppo.api import RewardTypeWrapper
 
 class FloatRewardTypeWrapper(RewardTypeWrapper[float]):
     def as_tensor(self):
-        return torch.as_tensor(self.reward)
+        return torch.as_tensor(self.reward, dtype=torch.float32)
 
 
 class RewardFunctionWrapper(RewardFunction[AgentID, StateType, RewardType]):

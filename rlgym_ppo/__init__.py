@@ -1,1 +1,1 @@
-from .learner import Learner
+from .learner import DEFAULT_CONFIG, Learner, LearnerConfig

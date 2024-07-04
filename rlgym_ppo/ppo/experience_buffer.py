@@ -19,17 +19,19 @@ from rlgym.api import ActionType, AgentID, ObsType
 class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
     @staticmethod
     def _cat(t1, t2, size):
-        if len(t2) > size:
+        t2_len = len(t2)
+        if t2_len > size:
             # t2 alone is larger than we want; copy the end
+            # TODO: do I need to clone here?
             t = t2[-size:].clone()
 
-        elif len(t2) == size:
+        elif t2_len == size:
             # t2 is a perfect match; just use it directly
             t = t2
 
-        elif len(t1) + len(t2) > size:
+        elif len(t1) + t2_len > size:
             # t1+t2 is larger than we want; use t2 wholly with the end of t1 before it
-            t = torch.cat((t1[len(t2) - size :], t2), 0)
+            t = torch.cat((t1[t2_len - size :], t2), 0)
 
         else:
             # t1+t2 does not exceed what we want; concatenate directly
@@ -37,6 +39,19 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
 
         del t1
         del t2
+        return t
+
+    @staticmethod
+    def _cat_list(cur, new, size):
+        new_len = len(new)
+        if new_len > size:
+            t = new[-size:]
+        elif new_len == size:
+            t = new
+        elif len(cur) + new_len > size:
+            t = cur[new_len - size :] + new
+        else:
+            t = cur + new
         return t
 
     def __init__(self, max_size, seed, device):
@@ -74,8 +89,9 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         """
 
         _cat = ExperienceBuffer._cat
-        self.observations += observations
-        self.actions += actions
+        _cat_list = ExperienceBuffer._cat_list
+        self.observations = _cat_list(self.observations, observations, self.max_size)
+        self.actions = _cat_list(self.actions, actions, self.max_size)
         self.log_probs = _cat(
             self.log_probs,
             torch.as_tensor(log_probs, dtype=torch.float32, device=self.device),

@@ -19,8 +19,6 @@ class Trajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
                 ActionType,
                 Tensor,
                 RewardType,
-                bool,
-                bool,
                 Optional[Tensor],
             ]
         ] = []
@@ -46,9 +44,7 @@ class Trajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
         :truncated: whether or not the episode has been truncated
         """
         if not self.done:
-            self.complete_timesteps.append(
-                (obs, action, log_prob, reward, terminated, truncated, None)
-            )
+            self.complete_timesteps.append((obs, action, log_prob, reward, None))
             self.done = terminated or truncated
             if self.done:
                 self.truncated = truncated
@@ -61,14 +57,12 @@ class Trajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
         :final_val_pred: value prediction for self.final_obs
         """
         for idx, timestep in enumerate(self.complete_timesteps):
-            (obs, action, log_prob, reward, terminated, truncated, _) = timestep
+            (obs, action, log_prob, reward, _) = timestep
             self.complete_timesteps[idx] = (
                 obs,
                 action,
                 log_prob,
                 reward,
-                terminated,
-                truncated,
                 val_preds[idx],
             )
         self.final_val_pred = final_val_pred

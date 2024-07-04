@@ -106,7 +106,6 @@ class BatchedAgentManager(
         self.current_log_probs: List[Dict[AgentID, torch.Tensor]] = []
 
         self.current_pids: List[int] = []
-        self.average_reward = None
         self.cumulative_timesteps = 0
         self.min_inference_size = min_inference_size
 

@@ -18,7 +18,6 @@ from typing import Callable, Generic, List, Optional, Tuple, Type, TypedDict, Un
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 from rlgym.api import (
     ActionSpaceType,
     ActionType,
@@ -32,6 +31,7 @@ from rlgym.api import (
 )
 from wandb.wandb_run import Run
 
+import wandb
 from rlgym_ppo.api import (
     ActorCriticManager,
     MetricsLogger,
@@ -165,11 +165,11 @@ class Learner(
         config: LearnerConfig = {},
     ):
         self.config: LearnerConfig = {**DEFAULT_CONFIG, **config}
-
         assert (
             env_create_function is not None
         ), "MUST PROVIDE A FUNCTION TO CREATE RLGYM FUNCTIONS TO INITIALIZE RLGYM-PPO"
 
+        checkpoints_save_folder = self.config["checkpoints_save_folder"]
         if checkpoints_save_folder is None:
             checkpoints_save_folder = os.path.join(
                 "data", "checkpoints", "rlgym-ppo-run"
@@ -177,32 +177,35 @@ class Learner(
 
         # Add the option for the user to turn off the addition of Unix Timestamps to
         # the ``checkpoints_save_folder`` path
-        if config["add_unix_timestamp"]:
+        if self.config["add_unix_timestamp"]:
             checkpoints_save_folder = f"{checkpoints_save_folder}-{time.time_ns()}"
 
-        torch.manual_seed(config["random_seed"])
-        np.random.seed(config["random_seed"])
-        random.seed(config["random_seed"])
+        torch.manual_seed(self.config["random_seed"])
+        np.random.seed(self.config["random_seed"])
+        random.seed(self.config["random_seed"])
 
         self.checkpoints_save_folder = checkpoints_save_folder
         self.metrics_logger = metrics_logger
         self.ts_since_last_save = 0
 
-        if config["device"] in {"auto", "gpu"} and torch.cuda.is_available():
+        if self.config["device"] in {"auto", "gpu"} and torch.cuda.is_available():
             self.device = "cuda:0"
             torch.backends.cudnn.benchmark = True
-        elif config["device"] == "auto" and not torch.cuda.is_available():
+        elif self.config["device"] == "auto" and not torch.cuda.is_available():
             self.device = "cpu"
         else:
-            self.device = config["device"]
+            self.device = self.config["device"]
 
         print(f"Using device {self.device}")
         self.return_stats = WelfordRunningStat(1)
+        self.average_reward = None
         self.epoch = 0
 
         self.experience_buffer: ExperienceBuffer[AgentID, ObsType, ActionType] = (
             ExperienceBuffer(
-                config["exp_buffer_size"], seed=config["random_seed"], device="cpu"
+                self.config["exp_buffer_size"],
+                seed=self.config["random_seed"],
+                device="cpu",
             )
         )
 
@@ -219,69 +222,101 @@ class Learner(
             reward_type_serde,
             obs_space_type_serde,
             action_space_type_serde,
-            min_inference_size=config["min_inference_size"],
-            seed=config["random_seed"],
-            steps_per_obs_stats_increment=config["steps_per_obs_stats_increment"],
-            recalculate_agent_id_every_step=config["recalculate_agent_id_every_step"],
+            min_inference_size=self.config["min_inference_size"],
+            seed=self.config["random_seed"],
+            steps_per_obs_stats_increment=self.config["steps_per_obs_stats_increment"],
+            recalculate_agent_id_every_step=self.config[
+                "recalculate_agent_id_every_step"
+            ],
         )
         (policy, value_net) = self.agent.init_processes(
             policy_factory=policy_factory,
             value_net_factory=value_net_factory,
             device=self.device,
-            n_processes=config["n_proc"],
+            n_processes=self.config["n_proc"],
             collect_metrics_fn=collect_metrics_fn,
-            spawn_delay=config["instance_launch_delay"],
-            render=config["render"],
-            render_delay=config["render_delay"],
-            shm_buffer_size=config["shm_buffer_size"],
+            spawn_delay=self.config["instance_launch_delay"],
+            render=self.config["render"],
+            render_delay=self.config["render_delay"],
+            shm_buffer_size=self.config["shm_buffer_size"],
         )
         print("Initializing PPO...")
-        if ppo_minibatch_size is None:
-            ppo_minibatch_size = config["ppo_batch_size"]
+        if self.config["ppo_minibatch_size"] is None:
+            ppo_minibatch_size = self.config["ppo_batch_size"]
+        else:
+            ppo_minibatch_size = self.config["ppo_minibatch_size"]
 
         self.ppo_learner = PPOLearner(
             policy=policy,
             value_net=value_net,
             device=self.device,
-            batch_size=config["ppo_batch_size"],
+            batch_size=self.config["ppo_batch_size"],
             mini_batch_size=ppo_minibatch_size,
-            n_epochs=config["ppo_epochs"],
-            policy_lr=config["policy_lr"],
-            critic_lr=config["critic_lr"],
-            clip_range=config["ppo_clip_range"],
-            ent_coef=config["ppo_ent_coef"],
+            n_epochs=self.config["ppo_epochs"],
+            policy_lr=self.config["policy_lr"],
+            critic_lr=self.config["critic_lr"],
+            clip_range=self.config["ppo_clip_range"],
+            ent_coef=self.config["ppo_ent_coef"],
         )
 
-        self.agent.policy = self.ppo_learner.policy
-
-        wandb_loaded = config["checkpoint_load_folder"] is not None and self.load(
-            config["checkpoint_load_folder"],
-            config["load_wandb"],
-            config["policy_lr"],
-            config["critic_lr"],
+        wandb_config = {
+            key: value
+            for (key, value) in self.config.items()
+            if key
+            in [
+                "n_proc",
+                "min_inference_size",
+                "timestep_limit",
+                "exp_buffer_size",
+                "ts_per_iteration",
+                "standardize_returns",
+                "standardize_obs",
+                "policy_layer_sizes",
+                "critic_layer_sizes",
+                "ppo_epochs",
+                "ppo_batch_size",
+                "ppo_minibatch_size",
+                "ppo_ent_coef",
+                "ppo_clip_range",
+                "gae_lambda",
+                "gae_gamma",
+                "policy_lr",
+                "critic_lr",
+            ]
+        }
+        self.wandb_run = self.config["wandb_run"]
+        wandb_loaded = self.config["checkpoint_load_folder"] is not None and self.load(
+            self.config["checkpoint_load_folder"],
+            self.config["load_wandb"],
+            self.config["policy_lr"],
+            self.config["critic_lr"],
         )
 
-        if config["log_to_wandb"] and self.wandb_run is None and not wandb_loaded:
+        if (
+            self.config["log_to_wandb"]
+            and self.config["wandb_run"] is None
+            and not wandb_loaded
+        ):
             project = (
                 "rlgym-ppo"
-                if config["wandb_project_name"] is None
-                else config["wandb_project_name"]
+                if self.config["wandb_project_name"] is None
+                else self.config["wandb_project_name"]
             )
             group = (
                 "unnamed-runs"
-                if config["wandb_group_name"] is None
-                else config["wandb_group_name"]
+                if self.config["wandb_group_name"] is None
+                else self.config["wandb_group_name"]
             )
             run_name = (
                 "rlgym-ppo-run"
-                if config["wandb_run_name"] is None
-                else config["wandb_run_name"]
+                if self.config["wandb_run_name"] is None
+                else self.config["wandb_run_name"]
             )
             print("Attempting to create new wandb run...")
             self.wandb_run = wandb.init(
                 project=project,
                 group=group,
-                config=self.config,
+                config=wandb_config,
                 name=run_name,
                 reinit=True,
             )
@@ -343,7 +378,7 @@ class Learner(
 
             # Collect the desired number of timesteps from our agent.
             trajectories, collected_metrics, steps_collected, collection_time = (
-                self.agent.collect_timesteps(self.config["ts_per_epoch"])
+                self.agent.collect_timesteps(self.config["ts_per_iteration"])
             )
 
             if self.metrics_logger is not None:
@@ -375,8 +410,8 @@ class Learner(
             report["Overall Steps per Second"] = steps_collected / epoch_time
 
             self.ts_since_last_save += steps_collected
-            if self.agent.average_reward is not None:
-                report["Policy Reward"] = self.agent.average_reward
+            if self.average_reward is not None:
+                report["Policy Reward"] = self.average_reward
             else:
                 report["Policy Reward"] = np.nan
 
@@ -437,14 +472,15 @@ class Learner(
         stop = 0
         val_net_input: List[Tuple[AgentID, ObsType]] = []
         for trajectory in trajectories:
-            val_net_input += [
+            traj_input = [
                 (trajectory.agent_id, obs)
                 for (obs, *_) in trajectory.complete_timesteps
             ]
-            val_net_input.append((trajectory.agent_id, trajectory.final_obs))
-            stop = start + len(val_net_input)
+            traj_input.append((trajectory.agent_id, trajectory.final_obs))
+            stop = start + len(traj_input)
             traj_timestep_idx_ranges.append((start, stop))
             start = stop
+            val_net_input += traj_input
 
         value_net = self.ppo_learner.value_net
 
@@ -461,7 +497,7 @@ class Learner(
             self.return_stats.std[0] if self.config["standardize_returns"] else None
         )
 
-        returns = self.add_experience(
+        returns, self.average_reward = self.add_experience(
             trajectories,
             gamma=self.config["gae_gamma"],
             lmbda=self.config["gae_lambda"],
@@ -492,7 +528,7 @@ class Learner(
         :param gamma: Gamma hyper-parameter.
         :param lmbda: Lambda hyper-parameter.
         :param return_std: Standard deviation of the returns (used for reward normalization).
-        :return: non-bootstrapped returns, for logging purposes
+        :return: non-bootstrapped returns and average reward, for logging purposes
         """
         observations: List[Tuple[AgentID, ObsType]] = []
         actions: List[ActionType] = []
@@ -500,22 +536,22 @@ class Learner(
         values: List[float] = []
         advantages: List[float] = []
         returns: List[float] = []
+        reward_sum = torch.as_tensor(0, dtype=torch.float32)
         for trajectory in trajectories:
-            cur_return = torch.as_tensor(0)
+            cur_return = torch.as_tensor(0, dtype=torch.float32)
             next_val_pred = (
                 trajectory.final_val_pred
                 if trajectory.truncated
-                else torch.as_tensor(0)
+                else torch.as_tensor(0, dtype=torch.float32)
             )
-            cur_advantages = torch.as_tensor(0)
+            cur_advantages = torch.as_tensor(0, dtype=torch.float32)
             for timestep in reversed(trajectory.complete_timesteps):
-                (obs, action, log_prob, reward, terminated, truncated, val_pred) = (
-                    timestep
-                )
+                (obs, action, log_prob, reward, val_pred) = timestep
                 reward_tensor = reward.as_tensor()
+                reward_sum += reward_tensor
                 if return_std is not None:
-                    norm_reward_tensor = torch.min(
-                        torch.max(reward_tensor / return_std, -10), 10
+                    norm_reward_tensor = torch.clamp(
+                        reward_tensor / return_std, min=-10, max=10
                     )
                 else:
                     norm_reward_tensor = reward_tensor
@@ -533,7 +569,8 @@ class Learner(
         self.experience_buffer.submit_experience(
             observations, actions, log_probs, values, advantages
         )
-        return returns
+        average_reward = reward_sum / len(observations)
+        return returns, average_reward.cpu().item()
 
     def save(self, cumulative_timesteps):
         """
@@ -572,7 +609,7 @@ class Learner(
         book_keeping_vars = {
             "cumulative_timesteps": self.agent.cumulative_timesteps,
             "cumulative_model_updates": self.ppo_learner.cumulative_model_updates,
-            "policy_average_reward": self.agent.average_reward,
+            "policy_average_reward": self.average_reward,
             "epoch": self.epoch,
             "ts_since_last_save": self.ts_since_last_save,
             "reward_running_stats": self.return_stats.to_json(),
@@ -614,7 +651,7 @@ class Learner(
         with open(os.path.join(folder_path, "BOOK_KEEPING_VARS.json"), "r") as f:
             book_keeping_vars = dict(json.load(f))
             self.agent.cumulative_timesteps = book_keeping_vars["cumulative_timesteps"]
-            self.agent.average_reward = book_keeping_vars["policy_average_reward"]
+            self.average_reward = book_keeping_vars["policy_average_reward"]
             self.ppo_learner.cumulative_model_updates = book_keeping_vars[
                 "cumulative_model_updates"
             ]
@@ -656,7 +693,7 @@ class Learner(
         :return: None.
         """
 
-        if self.wandb_run is not None:
+        if self.config["wandb_run"] is not None:
             self.wandb_run.finish()
         if type(self.agent) == BatchedAgentManager:
             self.agent.cleanup()
