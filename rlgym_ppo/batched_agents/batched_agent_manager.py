@@ -26,9 +26,10 @@ from rlgym_ppo.api import (
     TypeSerde,
     ValueNet,
 )
-from rlgym_ppo.batched_agents import BatchedTrajectory, Trajectory, comm_consts
+from rlgym_ppo.batched_agents import BatchedTrajectory, Trajectory
 from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
-from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
+from rlgym_ppo.util import comm_consts
+from rlgym_ppo.util.comm_consts import PACKET_MAX_SIZE
 
 try:
     from tqdm import tqdm
@@ -87,6 +88,7 @@ class BatchedAgentManager(
         reward_type_serde: TypeSerde[RewardType],
         obs_space_type_serde: TypeSerde[ObsSpaceType],
         action_space_type_serde: TypeSerde[ActionSpaceType],
+        decode_state_metrics_fn: Optional[Callable[[bytes], List[np.ndarray]]] = None,
         obs_standardizer: Optional[ObsStandardizer[AgentID, ObsType]] = None,
         min_inference_size=8,
         seed=123,
@@ -107,6 +109,7 @@ class BatchedAgentManager(
 
         self.actor_critic_manager = actor_critic_manager
         self.obs_standardizer = obs_standardizer
+        self.decode_state_metrics_fn = decode_state_metrics_fn
 
         self.current_obs: List[Dict[AgentID, ObsType]] = []
         self.current_actions: List[Dict[AgentID, ActionType]] = []
@@ -339,22 +342,11 @@ class BatchedAgentManager(
                 (truncated, offset) = comm_consts.retrieve_bool(shm_view, offset)
                 truncated_dict[agent_id] = truncated
 
-        (metrics_len, offset) = comm_consts.retrieve_int(shm_view, offset)
-
-        if metrics_len != 0:
-            metrics_shape = []
-            for _ in range(metrics_len):
-                (shape_dim, offset) = comm_consts.retrieve_int(shm_view, offset)
-                metrics_shape.append(shape_dim)
+        if self.decode_state_metrics_fn is not None:
             (metrics_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
-            metrics = np.frombuffer(metrics_bytes, dtype=np.float32).reshape(
-                metrics_shape
-            )
-        else:
-            metrics_shape = (0,)
-            metrics = np.empty(shape=metrics_shape, dtype=np.float32)
+            metrics = self.decode_state_metrics_fn(metrics_bytes)
 
-        collected_metrics.append(metrics.copy())
+        collected_metrics.append(metrics)
 
         if proc_id not in self.current_pids:
             self.current_pids.append(proc_id)
@@ -459,7 +451,7 @@ class BatchedAgentManager(
         value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
         device: str,
         n_processes: int,
-        collect_metrics_fn=None,
+        encode_state_metrics_fn: Optional[Callable[[StateType], bytes]] = None,
         spawn_delay=None,
         render=False,
         render_delay: Optional[float] = None,
@@ -555,7 +547,7 @@ class BatchedAgentManager(
                 time.sleep(spawn_delay)
 
             p = pickle.dumps(
-                ("initialization_data", self.build_env_fn, collect_metrics_fn)
+                ("initialization_data", self.build_env_fn, encode_state_metrics_fn)
             )
             parent_end.sendto(p, child_endpoint)
 

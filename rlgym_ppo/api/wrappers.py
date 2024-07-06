@@ -13,7 +13,7 @@ class RewardTypeWrapper(Generic[RewardType]):
         return getattr(self.reward, name)
 
     @abstractmethod
-    def as_tensor(self) -> Tensor:
+    def as_tensor(self, dtype: dtype, device: device) -> Tensor:
         """
         Transform this instance into a tensor, for the purposes of calculating
         returns and advantages.

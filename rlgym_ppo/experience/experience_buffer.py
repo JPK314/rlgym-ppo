@@ -9,14 +9,17 @@ Description:
 """
 
 import time
-from typing import Generic, List, Tuple
+from typing import Callable, Generic, List, Tuple
 
 import numpy as np
 import torch
-from rlgym.api import ActionType, AgentID, ObsType
+from rlgym.api import ActionType, AgentID, ObsType, RewardType
+
+from rlgym_ppo.api import TrajectoryProcessor
+from rlgym_ppo.experience import Trajectory
 
 
-class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
+class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
     @staticmethod
     def _cat(t1, t2, size):
         t2_len = len(t2)
@@ -54,7 +57,15 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
             t = cur + new
         return t
 
-    def __init__(self, max_size, seed, device):
+    def __init__(
+        self,
+        trajectory_processor: TrajectoryProcessor[
+            AgentID, ObsType, ActionType, RewardType
+        ],
+        max_size,
+        seed,
+        device,
+    ):
         self.device = device
         self.seed = seed
         self.observations: List[Tuple[AgentID, ObsType]] = []
@@ -64,14 +75,11 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
         self.advantages = torch.FloatTensor().to(self.device)
         self.max_size = max_size
         self.rng = np.random.RandomState(seed)
+        self.trajectory_processor = trajectory_processor
 
+    # TODO: update docs
     def submit_experience(
-        self,
-        observations: List[Tuple[AgentID, ObsType]],
-        actions: List[ActionType],
-        log_probs: List[torch.Tensor],
-        values: List[torch.Tensor],
-        advantages: List[torch.Tensor],
+        self, trajectories: List[Trajectory[AgentID, ActionType, ObsType, RewardType]]
     ):
         """
         Function to add experience to the buffer.
@@ -90,21 +98,27 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType]):
 
         _cat = ExperienceBuffer._cat
         _cat_list = ExperienceBuffer._cat_list
+        (observations, actions, log_probs, values, advantages) = (
+            self.trajectory_processor.process_trajectories(
+                trajectories, dtype=torch.float32, device=self.device
+            )
+        )
+
         self.observations = _cat_list(self.observations, observations, self.max_size)
         self.actions = _cat_list(self.actions, actions, self.max_size)
         self.log_probs = _cat(
             self.log_probs,
-            torch.as_tensor(log_probs, dtype=torch.float32, device=self.device),
+            log_probs,
             self.max_size,
         )
         self.values = _cat(
             self.values,
-            torch.as_tensor(values, dtype=torch.float32, device=self.device),
+            values,
             self.max_size,
         )
         self.advantages = _cat(
             self.advantages,
-            torch.as_tensor(advantages, dtype=torch.float32, device=self.device),
+            advantages,
             self.max_size,
         )
 

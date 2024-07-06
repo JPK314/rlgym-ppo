@@ -6,7 +6,6 @@ from typing import Generic, TypeVar
 T = TypeVar("T")
 
 
-# TODO: add obs builder wrapper that includes standardization
 class TypeSerde(Generic[T]):
     @abstractmethod
     def to_bytes(self, obj: T) -> bytes:

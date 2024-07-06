@@ -18,8 +18,16 @@ BOOL_SIZE = struct.calcsize("?")
 HEADER_SIZE = HEADER_LEN * FLOAT_SIZE
 
 
+# TODO: OK to use positive int here?
 def pack_int(val, endian="=") -> bytes:
     return struct.pack(endian + "I", val)
+
+
+def unpack_int(array: bytes, offset, endian="=") -> Tuple[int, int]:
+    return (
+        struct.unpack(endian + "I", array[offset : offset + INTEGER_SIZE])[0],
+        offset + INTEGER_SIZE,
+    )
 
 
 def pack_bool(val, endian="=") -> bytes:
@@ -51,7 +59,7 @@ def retrieve_bytes(array: np.ndarray, offset: int) -> Tuple[bytes, int]:
 
 
 def retrieve_bytes_from_message(array: bytes, offset: int) -> Tuple[bytes, int]:
-    (size, offset) = retrieve_int_from_message(array, offset)
+    (size, offset) = unpack_int(array, offset)
     return (array[offset : offset + size], offset + size)
 
 
@@ -65,13 +73,6 @@ def append_int(array: np.ndarray, offset: int, data: int, max_offset: int):
 def retrieve_int(array: np.ndarray, offset, endian="=") -> Tuple[int, int]:
     return (
         struct.unpack(endian + "I", array[offset : offset + INTEGER_SIZE].tobytes())[0],
-        offset + INTEGER_SIZE,
-    )
-
-
-def retrieve_int_from_message(array: bytes, offset, endian="=") -> Tuple[int, int]:
-    return (
-        struct.unpack(endian + "I", array[offset : offset + INTEGER_SIZE])[0],
         offset + INTEGER_SIZE,
     )
 

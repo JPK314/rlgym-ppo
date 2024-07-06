@@ -1,23 +1,14 @@
 from typing import Type
 
-import numpy as np
-import torch
-from rlgym.api import (
-    ActionType,
-    AgentID,
-    ObsType,
-    RewardFunction,
-    RewardType,
-    StateType,
-)
+from rlgym.api import AgentID, RewardFunction, RewardType, StateType
+from torch import as_tensor as _as_tensor
 
-from rlgym_ppo.api import PPOPolicy, RewardTypeWrapper
-from rlgym_ppo.util import WelfordRunningStat
+from rlgym_ppo.api import RewardTypeWrapper
 
 
 class FloatRewardTypeWrapper(RewardTypeWrapper[float]):
-    def as_tensor(self):
-        return torch.as_tensor(self.reward, dtype=torch.float32)
+    def as_tensor(self, dtype, device):
+        return _as_tensor(self.reward, dtype=dtype, device=device)
 
 
 class RewardFunctionWrapper(RewardFunction[AgentID, StateType, RewardType]):

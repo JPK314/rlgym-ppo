@@ -6,28 +6,33 @@ from rlgym.rocket_league.api import GameState
 from rlgym.rocket_league.common_values import CAR_MAX_SPEED
 from rlgym.rocket_league.obs_builders import DefaultObs
 
-from rlgym_ppo.api import MetricsLogger
 from rlgym_ppo.standard_impl import (
     BasicActorCriticManager,
     BasicValueEstimator,
     DiscreteFF,
     FloatRewardTypeWrapper,
     FloatSerde,
+    GAETrajectoryProcessor,
     NumpyDynamicShapeSerde,
     NumpyObsStandardizer,
+    PPOMetricsLogger,
     RewardFunctionWrapper,
     RewardTypeWrapperSerde,
     StrIntTupleSerde,
     StrSerde,
 )
+from rlgym_ppo.util import reporting
 
 
-class ExampleLogger(MetricsLogger):
-    def _collect_metrics(self, game_state: GameState) -> list:
+class ExampleLogger(PPOMetricsLogger[GameState, str, np.ndarray, np.ndarray, float]):
+    def __init__(self):
+        super().__init__(dtype=np.float32)
+
+    def collect_state_metrics(self, state):
         tot_cars = 0
         lin_vel_sum = np.zeros(3)
         ang_vel_sum = np.zeros(3)
-        for car_data in game_state.cars.values():
+        for car_data in state.cars.values():
             lin_vel_sum += car_data.physics.linear_velocity
             ang_vel_sum += car_data.physics.angular_velocity
             tot_cars += 1
@@ -37,19 +42,35 @@ class ExampleLogger(MetricsLogger):
             ang_vel_sum / tot_cars,
         ]
 
-    def _report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):
+    def report_metrics(
+        self,
+        collected_state_metrics,
+        ppo_metrics,
+        learner_metrics,
+        wandb_run,
+    ):
+        super().report_metrics(
+            collected_state_metrics, ppo_metrics, learner_metrics, wandb_run
+        )
         avg_linvel = np.zeros(3)
-        for metric_array in collected_metrics:
-            p0_linear_velocity = metric_array[0]
-            avg_linvel += p0_linear_velocity
-        avg_linvel /= len(collected_metrics)
+        avg_angvel = np.zeros(3)
+        for state_metrics in collected_state_metrics:
+            avg_linvel += state_metrics[0]
+            avg_angvel += state_metrics[1]
+        avg_linvel /= len(collected_state_metrics)
+        avg_angvel /= len(collected_state_metrics)
         report = {
-            "x_vel": avg_linvel[0],
-            "y_vel": avg_linvel[1],
-            "z_vel": avg_linvel[2],
-            "Cumulative Timesteps": cumulative_timesteps,
+            "linvel_x": avg_linvel[0],
+            "linvel_y": avg_linvel[1],
+            "linvel_z": avg_linvel[2],
+            "angvel_x": avg_angvel[0],
+            "angvel_y": avg_angvel[1],
+            "angvel_z": avg_angvel[2],
+            **ppo_metrics,
+            **learner_metrics,
+            "Policy Reward": np.nan,
         }
-        wandb_run.log(report)
+        reporting.report_metrics(report, wandb_run=wandb_run)
 
 
 class CustomObs(DefaultObs):
@@ -112,6 +133,10 @@ def value_net_factory(obs_space: Tuple[str, int], device: str):
     return BasicValueEstimator(obs_space[1], (256, 256, 256), device)
 
 
+def trajectory_processor_factory(**kwargs):
+    return GAETrajectoryProcessor(**kwargs)
+
+
 def env_create_function():
     import numpy as np
     from rlgym.api import RLGym
@@ -121,11 +146,7 @@ def env_create_function():
         GoalCondition,
         NoTouchTimeoutCondition,
     )
-    from rlgym.rocket_league.reward_functions import (
-        CombinedReward,
-        GoalReward,
-        TouchReward,
-    )
+    from rlgym.rocket_league.reward_functions import CombinedReward, TouchReward
     from rlgym.rocket_league.rlviser import RLViserRenderer
     from rlgym.rocket_league.sim import RocketSimEngine
     from rlgym.rocket_league.state_mutators import (
@@ -144,10 +165,6 @@ def env_create_function():
     action_parser = RepeatAction(LookupTableAction(), repeats=tick_skip)
     termination_condition = GoalCondition()
     truncation_condition = NoTouchTimeoutCondition(timeout=timeout_seconds)
-
-    goal_reward_and_weight = (GoalReward(), 10)
-    touch_reward_and_weight = (TouchReward(), 0.1)
-    rewards_and_weights = (goal_reward_and_weight, touch_reward_and_weight)
 
     reward_fn = RewardFunctionWrapper(
         CombinedReward((TouchReward(), 1), (VelocityPlayerToBallReward(), 0.1)),
@@ -192,22 +209,22 @@ if __name__ == "__main__":
 
     # educated guess - could be slightly higher or lower
     min_inference_size = max(1, int(round(n_proc * 0.9)))
-    config: LearnerConfig = {
-        "n_proc": n_proc,
-        "min_inference_size": min_inference_size,
-        "ppo_batch_size": 50000,
-        "ts_per_iteration": 50000,
-        "exp_buffer_size": 150000,
-        "ppo_minibatch_size": 50000,
-        "ppo_ent_coef": 0.001,
-        "ppo_epochs": 1,
-        "standardize_returns": True,
-        "save_every_ts": 100000,
-        "timestep_limit": 1000000000,
-        "log_to_wandb": True,
-        "wandb_group_name": "rlgym-ppo-testing",
-        "render": False,
-    }
+    config = LearnerConfig(
+        n_proc=n_proc,
+        min_inference_size=min_inference_size,
+        ppo_batch_size=50_000,
+        ts_per_iteration=50_000,
+        exp_buffer_size=150_000,
+        ppo_minibatch_size=50_000,
+        ppo_ent_coef=0.001,
+        ppo_epochs=1,
+        save_every_ts=100_000,
+        timestep_limit=1_000_000_000,
+        log_to_wandb=True,
+        wandb_group_name="rlgym-ppo-testing",
+        render=False,
+        trajectory_processor_args={"standardize_returns": True},
+    )
     learner = Learner(
         env_create_function=env_create_function,
         actor_critic_manager=BasicActorCriticManager(),
@@ -219,6 +236,7 @@ if __name__ == "__main__":
         action_space_type_serde=StrIntTupleSerde(),
         policy_factory=policy_factory,
         value_net_factory=value_net_factory,
+        trajectory_processor_factory=trajectory_processor_factory,
         obs_standardizer=NumpyObsStandardizer(5),
         metrics_logger=ExampleLogger(),
         config=config,

@@ -1,1 +1,2 @@
-from .learner import DEFAULT_CONFIG, Learner, LearnerConfig
+from .learner import Learner
+from .typing import LearnerConfig, LearnerMetrics

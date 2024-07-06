@@ -7,14 +7,8 @@ Description:
 
 """
 
-from typing import List, Tuple
-
 import torch
 import torch.nn as nn
-from rlgym.api import ActionType, AgentID, ObsType, RewardType
-
-from rlgym_ppo.api import RewardTypeWrapper
-from rlgym_ppo.batched_agents import Trajectory
 
 
 class MapContinuousToAction(nn.Module):

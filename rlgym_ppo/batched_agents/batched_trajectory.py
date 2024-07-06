@@ -6,13 +6,12 @@ Description:
     A class to maintain timesteps from batched agents in synchronized sequences.
 """
 
-from typing import Dict, Generic, Iterable, List, Tuple
+from typing import Dict, Generic, Iterable, List
 
-import numpy as np
 from rlgym.api import ActionType, AgentID, ObsType, RewardType
 from torch import Tensor
 
-from rlgym_ppo.batched_agents import Trajectory
+from rlgym_ppo.experience import Trajectory
 
 
 class BatchedTrajectory(Generic[AgentID, ActionType, ObsType, RewardType]):

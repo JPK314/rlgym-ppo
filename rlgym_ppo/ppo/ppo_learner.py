@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Callable, Generic
+from typing import Callable, Generic, Optional
 
 import numpy as np
 import torch
@@ -8,7 +8,8 @@ from rlgym.api import ActionSpaceType, ActionType, AgentID, ObsSpaceType, ObsTyp
 from torch import nn as nn
 
 from rlgym_ppo.api import PPOPolicy, ValueNet
-from rlgym_ppo.ppo import ExperienceBuffer
+from rlgym_ppo.experience import ExperienceBuffer
+from rlgym_ppo.ppo import PPOMetrics
 
 
 class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpaceType]):
@@ -70,15 +71,17 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         self.ent_coef = ent_coef
         self.cumulative_model_updates = 0
 
-    def learn(self, exp: ExperienceBuffer[AgentID, ObsType, ActionType]):
+    def learn(
+        self,
+        exp: ExperienceBuffer[AgentID, ObsType, ActionType],
+        collect_metrics_fn: Optional[Callable[[PPOMetrics], None]],
+    ):
         """
         Compute PPO updates with an experience buffer.
 
         Args:
             exp (ExperienceBuffer): Experience buffer containing training data.
-
-        Returns:
-            dict: Dictionary containing training report metrics.
+            collect_metrics_fn: Function to be called with the PPO metrics resulting from learn()
         """
 
         n_iterations = 0
@@ -203,23 +206,23 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         policy_update_magnitude = (policy_before - policy_after).norm().item()
         critic_update_magnitude = (critic_before - critic_after).norm().item()
 
-        # Assemble and return report dictionary.
-        self.cumulative_model_updates += n_iterations
-
-        report = {
-            "PPO Batch Consumption Time": (time.time() - t1) / n_iterations,
-            "Cumulative Model Updates": self.cumulative_model_updates,
-            "Policy Entropy": mean_entropy,
-            "Mean KL Divergence": mean_divergence,
-            "Value Function Loss": mean_val_loss,
-            "SB3 Clip Fraction": mean_clip,
-            "Policy Update Magnitude": policy_update_magnitude,
-            "Value Function Update Magnitude": critic_update_magnitude,
-        }
         self.policy_optimizer.zero_grad()
         self.value_optimizer.zero_grad()
 
-        return report
+        self.cumulative_model_updates += n_iterations
+        if collect_metrics_fn is not None:
+            collect_metrics_fn(
+                PPOMetrics(
+                    (time.time() - t1) / n_iterations,
+                    self.cumulative_model_updates,
+                    mean_entropy,
+                    mean_divergence,
+                    mean_val_loss,
+                    mean_clip,
+                    policy_update_magnitude,
+                    critic_update_magnitude,
+                )
+            )
 
     def save_to(self, folder_path):
         os.makedirs(folder_path, exist_ok=True)

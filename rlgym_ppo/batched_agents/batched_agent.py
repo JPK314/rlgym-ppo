@@ -8,7 +8,7 @@ from rlgym.api import (
 )
 
 from rlgym_ppo.api import TypeSerde
-from rlgym_ppo.batched_agents.comm_consts import PACKET_MAX_SIZE
+from rlgym_ppo.util.comm_consts import PACKET_MAX_SIZE
 
 
 def batched_agent_process(
@@ -56,8 +56,8 @@ def batched_agent_process(
         StateType,
     )
 
-    from rlgym_ppo.batched_agents import comm_consts
-    from rlgym_ppo.batched_agents.comm_consts import BOOL_SIZE, INTEGER_SIZE
+    from rlgym_ppo.util import comm_consts
+    from rlgym_ppo.util.comm_consts import BOOL_SIZE, INTEGER_SIZE
 
     if render:
         try:
@@ -204,13 +204,6 @@ def batched_agent_process(
                     n_agents = len(env.agents)
                     done_agents = {agent_id: False for agent_id in env.agents}
 
-                if metrics_encoding_function is not None:
-                    metrics = metrics_encoding_function(env.state)
-                    metrics_shape: List[int] = [arg for arg in metrics.shape]
-                else:
-                    metrics = np.empty(shape=(0,))
-                    metrics_shape = []
-
                 if recalculate_agentid_every_step and not new_episode:
                     serialized_agent_ids = {
                         agent_id: agent_id_serde.to_bytes(agent_id)
@@ -302,16 +295,11 @@ def batched_agent_process(
                             shm_size,
                         )
 
-                offset = comm_consts.append_int(
-                    shm_view, offset, len(metrics_shape), shm_size
-                )
-                for shape_dim in metrics_shape:
-                    offset = comm_consts.append_int(
-                        shm_view, offset, shape_dim, shm_size
+                if metrics_encoding_function is not None:
+                    metrics_bytes = metrics_encoding_function(env.state)
+                    offset = comm_consts.append_bytes(
+                        shm_view, offset, metrics_bytes, shm_size
                     )
-                offset = comm_consts.append_bytes(
-                    shm_view, offset, metrics.tobytes(), shm_size
-                )
 
                 if new_episode:
                     persistent_truncated_dict = {

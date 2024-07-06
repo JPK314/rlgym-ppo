@@ -11,6 +11,7 @@ INTEGER_SIZE = struct.calcsize("I")
 BOOL_SIZE = struct.calcsize("?")
 
 
+# TODO: use comm_consts
 class NumpyDynamicShapeSerde(TypeSerde[np.ndarray]):
     def __init__(self, dtype: np.dtype):
         self.dtype = dtype

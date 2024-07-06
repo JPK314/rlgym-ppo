@@ -32,91 +32,21 @@ from rlgym.api import (
 from wandb.wandb_run import Run
 
 import wandb
+from rlgym_ppo import LearnerConfig, LearnerMetrics
 from rlgym_ppo.api import (
     ActorCriticManager,
     MetricsLogger,
     ObsStandardizer,
     PPOPolicy,
     RewardTypeWrapper,
+    TrajectoryProcessor,
     TypeSerde,
     ValueNet,
 )
-from rlgym_ppo.batched_agents import BatchedAgentManager, Trajectory
-from rlgym_ppo.ppo import ExperienceBuffer, PPOLearner
-from rlgym_ppo.util import KBHit, WelfordRunningStat, reporting, torch_functions
-
-
-class LearnerConfig(TypedDict):
-    n_proc: int
-    min_inference_size: int
-    render: bool
-    render_delay: float
-    timestep_limit: int
-    exp_buffer_size: int
-    ts_per_iteration: int
-    standardize_returns: bool
-    max_returns_per_stats_increment: int
-    ppo_epochs: int
-    ppo_batch_size: int
-    ppo_minibatch_size: Optional[int]
-    ppo_ent_coef: float
-    ppo_clip_range: float
-    gae_lambda: float
-    gae_gamma: float
-    policy_lr: float
-    critic_lr: float
-    log_to_wandb: bool
-    load_wandb: bool
-    wandb_project_name: Optional[str]
-    wandb_group_name: Optional[str]
-    wandb_run_name: Optional[str]
-    checkpoints_save_folder: Optional[str]
-    add_unix_timestamp: bool
-    checkpoint_load_folder: Optional[str]
-    save_every_ts: int
-    instance_launch_delay: Optional[float]
-    random_seed: int
-    n_checkpoints_to_keep: int
-    shm_buffer_size: int
-    device: str
-    recalculate_agent_id_every_step: bool
-
-
-DEFAULT_CONFIG: LearnerConfig = {
-    "n_proc": 8,
-    "min_inference_size": 80,
-    "render": False,
-    "render_delay": 0,
-    "timestep_limit": 5_000_000_000,
-    "exp_buffer_size": 100000,
-    "ts_per_iteration": 50000,
-    "standardize_returns": True,
-    "max_returns_per_stats_increment": 150,
-    "ppo_epochs": 10,
-    "ppo_batch_size": 50000,
-    "ppo_minibatch_size": None,
-    "ppo_ent_coef": 0.005,
-    "ppo_clip_range": 0.2,
-    "gae_lambda": 0.95,
-    "gae_gamma": 0.99,
-    "policy_lr": 3e-4,
-    "critic_lr": 3e-4,
-    "log_to_wandb": False,
-    "load_wandb": True,
-    "wandb_project_name": None,
-    "wandb_group_name": None,
-    "wandb_run_name": None,
-    "checkpoints_save_folder": None,
-    "add_unix_timestamp": True,
-    "checkpoint_load_folder": None,
-    "save_every_ts": 1_000_000,
-    "instance_launch_delay": None,
-    "random_seed": 123,
-    "n_checkpoints_to_keep": 5,
-    "shm_buffer_size": 8192,
-    "device": "auto",
-    "recalculate_agent_id_every_step": False,
-}
+from rlgym_ppo.batched_agents import BatchedAgentManager
+from rlgym_ppo.experience import ExperienceBuffer, Trajectory
+from rlgym_ppo.ppo import PPOLearner
+from rlgym_ppo.util import KBHit, WelfordRunningStat
 
 
 class Learner(
@@ -158,17 +88,22 @@ class Learner(
             PPOPolicy[AgentID, ObsType, ActionType],
         ],
         value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
+        trajectory_processor_factory: Callable[
+            ..., TrajectoryProcessor[AgentID, ObsType, ActionType, RewardType]
+        ],
         obs_standardizer: Optional[ObsStandardizer] = None,
-        metrics_logger: Optional[MetricsLogger[StateType]] = None,
+        metrics_logger: Optional[
+            MetricsLogger[StateType, AgentID, ActionType, ObsType, RewardType]
+        ] = None,
         wandb_run: Optional[Run] = None,
-        config: LearnerConfig = {},
+        config=LearnerConfig(),
     ):
-        self.config: LearnerConfig = {**DEFAULT_CONFIG, **config}
+        self.config = config
         assert (
             env_create_function is not None
         ), "MUST PROVIDE A FUNCTION TO CREATE RLGYM FUNCTIONS TO INITIALIZE RLGYM-PPO"
 
-        checkpoints_save_folder = self.config["checkpoints_save_folder"]
+        checkpoints_save_folder = self.config.checkpoints_save_folder
         if checkpoints_save_folder is None:
             checkpoints_save_folder = os.path.join(
                 "data", "checkpoints", "rlgym-ppo-run"
@@ -176,41 +111,48 @@ class Learner(
 
         # Add the option for the user to turn off the addition of Unix Timestamps to
         # the ``checkpoints_save_folder`` path
-        if self.config["add_unix_timestamp"]:
+        if self.config.add_unix_timestamp:
             checkpoints_save_folder = f"{checkpoints_save_folder}-{time.time_ns()}"
 
-        torch.manual_seed(self.config["random_seed"])
-        np.random.seed(self.config["random_seed"])
-        random.seed(self.config["random_seed"])
+        torch.manual_seed(self.config.random_seed)
+        np.random.seed(self.config.random_seed)
+        random.seed(self.config.random_seed)
 
         self.checkpoints_save_folder = checkpoints_save_folder
         self.metrics_logger = metrics_logger
         self.ts_since_last_save = 0
 
-        if self.config["device"] in {"auto", "gpu"} and torch.cuda.is_available():
+        if self.config.device in {"auto", "gpu"} and torch.cuda.is_available():
             self.device = "cuda:0"
             torch.backends.cudnn.benchmark = True
-        elif self.config["device"] == "auto" and not torch.cuda.is_available():
+        elif self.config.device == "auto" and not torch.cuda.is_available():
             self.device = "cpu"
         else:
-            self.device = self.config["device"]
+            self.device = self.config.device
 
         print(f"Using device {self.device}")
         self.return_stats = WelfordRunningStat(1)
         self.average_reward = None
-        self.epoch = 0
+        self.iteration = 0
 
         self.experience_buffer: ExperienceBuffer[AgentID, ObsType, ActionType] = (
             ExperienceBuffer(
-                self.config["exp_buffer_size"],
-                seed=self.config["random_seed"],
+                trajectory_processor_factory(**self.config.trajectory_processor_args),
+                self.config.exp_buffer_size,
+                seed=self.config.random_seed,
                 device="cpu",
             )
         )
 
         print("Initializing processes...")
-        collect_metrics_fn = (
-            None if metrics_logger is None else self.metrics_logger.collect_metrics
+        self.encode_state_metrics_fn = (
+            None if metrics_logger is None else self.metrics_logger.encode_state_metrics
+        )
+        self.decode_state_metrics_fn = (
+            None if metrics_logger is None else self.metrics_logger.decode_state_metrics
+        )
+        self.collect_ppo_metrics_fn = (
+            None if metrics_logger is None else self.metrics_logger.collect_ppo_metrics
         )
         self.agent = BatchedAgentManager(
             env_create_function,
@@ -222,45 +164,43 @@ class Learner(
             obs_space_type_serde,
             action_space_type_serde,
             obs_standardizer=obs_standardizer,
-            min_inference_size=self.config["min_inference_size"],
-            seed=self.config["random_seed"],
-            recalculate_agent_id_every_step=self.config[
-                "recalculate_agent_id_every_step"
-            ],
+            min_inference_size=self.config.min_inference_size,
+            seed=self.config.random_seed,
+            recalculate_agent_id_every_step=self.config.recalculate_agent_id_every_step,
         )
         (policy, value_net) = self.agent.init_processes(
             policy_factory=policy_factory,
             value_net_factory=value_net_factory,
             device=self.device,
-            n_processes=self.config["n_proc"],
-            collect_metrics_fn=collect_metrics_fn,
-            spawn_delay=self.config["instance_launch_delay"],
-            render=self.config["render"],
-            render_delay=self.config["render_delay"],
-            shm_buffer_size=self.config["shm_buffer_size"],
+            n_processes=self.config.n_proc,
+            encode_metrics_fn=self.encode_state_metrics_fn,
+            decode_metrics_fn=self.decode_state_metrics_fn,
+            spawn_delay=self.config.instance_launch_delay,
+            render=self.config.render,
+            render_delay=self.config.render_delay,
+            shm_buffer_size=self.config.shm_buffer_size,
         )
         print("Initializing PPO...")
-        if self.config["ppo_minibatch_size"] is None:
-            ppo_minibatch_size = self.config["ppo_batch_size"]
+        if self.config.ppo_minibatch_size is None:
+            ppo_minibatch_size = self.config.ppo_batch_size
         else:
-            ppo_minibatch_size = self.config["ppo_minibatch_size"]
+            ppo_minibatch_size = self.config.ppo_minibatch_size
 
         self.ppo_learner = PPOLearner(
             policy=policy,
             value_net=value_net,
             device=self.device,
-            batch_size=self.config["ppo_batch_size"],
+            batch_size=self.config.ppo_batch_size,
             mini_batch_size=ppo_minibatch_size,
-            n_epochs=self.config["ppo_epochs"],
-            policy_lr=self.config["policy_lr"],
-            critic_lr=self.config["critic_lr"],
-            clip_range=self.config["ppo_clip_range"],
-            ent_coef=self.config["ppo_ent_coef"],
+            n_epochs=self.config.ppo_epochs,
+            policy_lr=self.config.policy_lr,
+            critic_lr=self.config.critic_lr,
+            clip_range=self.config.ppo_clip_range,
+            ent_coef=self.config.ppo_ent_coef,
         )
-
         wandb_config = {
             key: value
-            for (key, value) in self.config.items()
+            for (key, value) in self.config.__dict__.items()
             if key
             in [
                 "n_proc",
@@ -268,7 +208,6 @@ class Learner(
                 "timestep_limit",
                 "exp_buffer_size",
                 "ts_per_iteration",
-                "standardize_returns",
                 "standardize_obs",
                 "policy_layer_sizes",
                 "critic_layer_sizes",
@@ -277,35 +216,34 @@ class Learner(
                 "ppo_minibatch_size",
                 "ppo_ent_coef",
                 "ppo_clip_range",
-                "gae_lambda",
-                "gae_gamma",
                 "policy_lr",
                 "critic_lr",
             ]
         }
+        wandb_config = {**wandb_config, **self.config.trajectory_processor_args}
         self.wandb_run = wandb_run
-        wandb_loaded = self.config["checkpoint_load_folder"] is not None and self.load(
-            self.config["checkpoint_load_folder"],
-            self.config["load_wandb"],
-            self.config["policy_lr"],
-            self.config["critic_lr"],
+        wandb_loaded = self.config.checkpoint_load_folder is not None and self.load(
+            self.config.checkpoint_load_folder,
+            self.config.load_wandb,
+            self.config.policy_lr,
+            self.config.critic_lr,
         )
 
-        if self.config["log_to_wandb"] and self.wandb_run is None and not wandb_loaded:
+        if self.config.log_to_wandb and self.wandb_run is None and not wandb_loaded:
             project = (
                 "rlgym-ppo"
-                if self.config["wandb_project_name"] is None
-                else self.config["wandb_project_name"]
+                if self.config.wandb_project_name is None
+                else self.config.wandb_project_name
             )
             group = (
                 "unnamed-runs"
-                if self.config["wandb_group_name"] is None
-                else self.config["wandb_group_name"]
+                if self.config.wandb_group_name is None
+                else self.config.wandb_group_name
             )
             run_name = (
                 "rlgym-ppo-run"
-                if self.config["wandb_run_name"] is None
-                else self.config["wandb_run_name"]
+                if self.config.wandb_run_name is None
+                else self.config.wandb_run_name
             )
             print("Attempting to create new wandb run...")
             self.wandb_run = wandb.init(
@@ -367,19 +305,14 @@ class Learner(
 
         # While the number of timesteps we have collected so far is less than the
         # amount we are allowed to collect.
-        while self.agent.cumulative_timesteps < self.config["timestep_limit"]:
-            epoch_start = time.perf_counter()
+        while self.agent.cumulative_timesteps < self.config.timestep_limit:
+            iteration_start = time.perf_counter()
             report = {}
 
             # Collect the desired number of timesteps from our agent.
             trajectories, collected_metrics, steps_collected, collection_time = (
-                self.agent.collect_timesteps(self.config["ts_per_iteration"])
+                self.agent.collect_timesteps(self.config.ts_per_iteration)
             )
-
-            if self.metrics_logger is not None:
-                self.metrics_logger.report_metrics(
-                    collected_metrics, self.wandb_run, self.agent.cumulative_timesteps
-                )
 
             # Add the new experience to our buffer and compute the various
             # reinforcement learning quantities we need to
@@ -387,33 +320,27 @@ class Learner(
             self.add_new_experience(trajectories)
 
             # Let PPO compute updates using our experience buffer.
-            ppo_report = self.ppo_learner.learn(self.experience_buffer)
-            epoch_stop = time.perf_counter()
-            epoch_time = epoch_stop - epoch_start
+            ppo_report = self.ppo_learner.learn(
+                self.experience_buffer, self.collect_ppo_metrics_fn
+            )
+            iteration_stop = time.perf_counter()
+            iteration_time = iteration_stop - iteration_start
 
-            # Report variables we care about.
-            report.update(ppo_report)
-            if self.epoch < 1:
-                report["Value Function Loss"] = np.nan
+            self.metrics_logger.collect_learner_metrics(
+                LearnerMetrics(
+                    self.agent.cumulative_timesteps,
+                    iteration_time,
+                    steps_collected,
+                    collection_time,
+                )
+            )
 
-            report["Cumulative Timesteps"] = self.agent.cumulative_timesteps
-            report["Total Iteration Time"] = epoch_time
-            report["Timesteps Collected"] = steps_collected
-            report["Timestep Collection Time"] = collection_time
-            report["Timestep Consumption Time"] = epoch_time - collection_time
-            report["Collected Steps per Second"] = steps_collected / collection_time
-            report["Overall Steps per Second"] = steps_collected / epoch_time
+            if self.metrics_logger is not None:
+                self.metrics_logger.report_metrics(
+                    collected_metrics, self.wandb_run, self.agent.cumulative_timesteps
+                )
 
             self.ts_since_last_save += steps_collected
-            if self.average_reward is not None:
-                report["Policy Reward"] = self.average_reward
-            else:
-                report["Policy Reward"] = np.nan
-
-            # Log to wandb and print to the console.
-            reporting.report_metrics(
-                loggable_metrics=report, debug_metrics=None, wandb_run=self.wandb_run
-            )
 
             report.clear()
             ppo_report.clear()
@@ -441,11 +368,11 @@ class Learner(
                     print("Resuming...\n")
 
             # Save if we've reached the next checkpoint timestep.
-            if self.ts_since_last_save >= self.config["save_every_ts"]:
+            if self.ts_since_last_save >= self.config.save_every_ts:
                 self.save(self.agent.cumulative_timesteps)
                 self.ts_since_last_save = 0
 
-            self.epoch += 1
+            self.iteration += 1
 
     @torch.no_grad()
     def add_new_experience(
@@ -479,7 +406,7 @@ class Learner(
 
         value_net = self.ppo_learner.value_net
 
-        # Predict the expected returns at each state.
+        # Update the trajectories with the value predictions.
         val_preds: torch.Tensor = value_net(val_net_input).cpu().flatten()
         torch.cuda.empty_cache()
         for idx, (start, stop) in enumerate(traj_timestep_idx_ranges):
@@ -487,85 +414,7 @@ class Learner(
             final_val_pred = val_preds[stop - 1]
             trajectories[idx].update_val_preds(val_preds_traj, final_val_pred)
 
-        # Compute the desired reinforcement learning quantities.
-        ret_std = (
-            self.return_stats.std[0] if self.config["standardize_returns"] else None
-        )
-
-        returns, self.average_reward = self.add_experience(
-            trajectories,
-            gamma=self.config["gae_gamma"],
-            lmbda=self.config["gae_lambda"],
-            return_std=ret_std,  # 1 by default if no standardization is requested
-        )
-
-        if self.config["standardize_returns"]:
-            # Update the running statistics about the returns.
-            n_to_increment = min(
-                self.config["max_returns_per_stats_increment"], len(returns)
-            )
-            for sample in returns[:n_to_increment]:
-                self.return_stats.update(sample)
-
-    @torch.no_grad
-    def add_experience(
-        self,
-        trajectories: List[
-            Trajectory[AgentID, ActionType, ObsType, RewardTypeWrapper[RewardType]]
-        ],
-        gamma=0.99,
-        lmbda=0.95,
-        return_std=None,
-    ):
-        """
-        :param experience_buffer: Experience buffer to add to
-        :param trajectories: List of trajectories with value predictions.
-        :param gamma: Gamma hyper-parameter.
-        :param lmbda: Lambda hyper-parameter.
-        :param return_std: Standard deviation of the returns (used for reward normalization).
-        :return: non-bootstrapped returns and average reward, for logging purposes
-        """
-        observations: List[Tuple[AgentID, ObsType]] = []
-        actions: List[ActionType] = []
-        log_probs: List[torch.Tensor] = []
-        values: List[float] = []
-        advantages: List[float] = []
-        returns: List[float] = []
-        reward_sum = torch.as_tensor(0, dtype=torch.float32)
-        for trajectory in trajectories:
-            cur_return = torch.as_tensor(0, dtype=torch.float32)
-            next_val_pred = (
-                trajectory.final_val_pred
-                if trajectory.truncated
-                else torch.as_tensor(0, dtype=torch.float32)
-            )
-            cur_advantages = torch.as_tensor(0, dtype=torch.float32)
-            for timestep in reversed(trajectory.complete_timesteps):
-                (obs, action, log_prob, reward, val_pred) = timestep
-                reward_tensor = reward.as_tensor()
-                reward_sum += reward_tensor
-                if return_std is not None:
-                    norm_reward_tensor = torch.clamp(
-                        reward_tensor / return_std, min=-10, max=10
-                    )
-                else:
-                    norm_reward_tensor = reward_tensor
-                delta = norm_reward_tensor + gamma * next_val_pred - val_pred
-                next_val_pred = val_pred
-                cur_advantages = delta + gamma * lmbda * cur_advantages
-                cur_return = norm_reward_tensor + gamma * cur_return
-                returns.append(cur_return.detach().item())
-                observations.append((trajectory.agent_id, obs))
-                actions.append(action)
-                log_probs.append(log_prob)
-                values.append(val_pred)
-                advantages.append(cur_advantages)
-
-        self.experience_buffer.submit_experience(
-            observations, actions, log_probs, values, advantages
-        )
-        average_reward = reward_sum / len(observations)
-        return returns, average_reward.cpu().item()
+        self.experience_buffer.submit_experience(trajectories)
 
     def save(self, cumulative_timesteps):
         """
@@ -587,10 +436,10 @@ class Learner(
         existing_checkpoints = [
             int(arg) for arg in os.listdir(self.checkpoints_save_folder)
         ]
-        if len(existing_checkpoints) > self.config["n_checkpoints_to_keep"]:
+        if len(existing_checkpoints) > self.config.n_checkpoints_to_keep:
             existing_checkpoints.sort()
             for checkpoint_name in existing_checkpoints[
-                : -self.config["n_checkpoints_to_keep"]
+                : -self.config.n_checkpoints_to_keep
             ]:
                 shutil.rmtree(
                     os.path.join(self.checkpoints_save_folder, str(checkpoint_name))
@@ -605,13 +454,12 @@ class Learner(
             "cumulative_timesteps": self.agent.cumulative_timesteps,
             "cumulative_model_updates": self.ppo_learner.cumulative_model_updates,
             "policy_average_reward": self.average_reward,
-            "epoch": self.epoch,
+            "iteration": self.iteration,
             "ts_since_last_save": self.ts_since_last_save,
-            "reward_running_stats": self.return_stats.to_json(),
         }
-        if self.config["standardize_returns"]:
-            book_keeping_vars["reward_running_stats"] = self.return_stats.to_json()
-
+        # if self.config.standardize_returns:
+        #     book_keeping_vars["reward_running_stats"] = self.return_stats.to_json()
+        # TODO: handle saving TrajectoryProcessor
         if self.wandb_run is not None:
             book_keeping_vars["wandb_run_id"] = self.wandb_run.id
             book_keeping_vars["wandb_project"] = self.wandb_run.project
@@ -652,13 +500,14 @@ class Learner(
             ]
             self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
 
-            if (
-                self.config["standardize_returns"]
-                and "reward_running_stats" in book_keeping_vars.keys()
-            ):
-                self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
+            # TODO: handle loading trajectory processor
+            # if (
+            #     self.config.standardize_returns
+            #     and "reward_running_stats" in book_keeping_vars.keys()
+            # ):
+            #     self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
 
-            self.epoch = book_keeping_vars["epoch"]
+            self.iteration = book_keeping_vars["iteration"]
 
             # Update learning rates if new values are provided
             if new_policy_lr is not None or new_critic_lr is not None:

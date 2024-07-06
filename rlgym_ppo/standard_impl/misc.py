@@ -1,9 +1,10 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
-from rlgym.api import AgentID
+import torch
+from rlgym.api import ActionType, AgentID, ObsType, RewardType
 
-from rlgym_ppo.api import ObsStandardizer
+from rlgym_ppo.api import ObsStandardizer, TrajectoryProcessor
 from rlgym_ppo.util import WelfordRunningStat
 
 
@@ -42,3 +43,78 @@ class NumpyObsStandardizer(ObsStandardizer[AgentID, np.ndarray]):
             (agent_id, (obs - self.obs_stats.mean) / self.obs_stats.std)
             for (agent_id, obs) in obs_list
         ]
+
+
+class GAETrajectoryProcessor(
+    TrajectoryProcessor[AgentID, ObsType, ActionType, RewardType]
+):
+    def __init__(
+        self,
+        gamma=0.99,
+        lmbda=0.95,
+        standardize_returns=True,
+        max_returns_per_stats_increment=150,
+    ):
+        """
+        :param gamma: Gamma hyper-parameter.
+        :param lmbda: Lambda hyper-parameter.
+        :param return_std: Standard deviation of the returns (used for reward normalization).
+        """
+        self.gamma = gamma
+        self.lmbda = lmbda
+        self.return_stats = WelfordRunningStat(1)
+        self.standardize_returns = standardize_returns
+        self.max_returns_per_stats_increment = max_returns_per_stats_increment
+
+    def process_trajectories(self, trajectories, dtype, device):
+        return_std = self.return_stats.std[0] if self.standardize_returns else None
+        gamma = self.gamma
+        lmbda = self.lmbda
+        observations: List[Tuple[AgentID, ObsType]] = []
+        actions: List[ActionType] = []
+        log_probs: List[torch.Tensor] = []
+        values: List[float] = []
+        advantages: List[float] = []
+        returns: List[float] = []
+        reward_sum = torch.as_tensor(0, dtype=dtype, device=device)
+        for trajectory in trajectories:
+            cur_return = torch.as_tensor(0, dtype=dtype, device=device)
+            next_val_pred = (
+                trajectory.final_val_pred
+                if trajectory.truncated
+                else torch.as_tensor(0, dtype=dtype, device=device)
+            )
+            cur_advantages = torch.as_tensor(0, dtype=dtype, device=device)
+            for timestep in reversed(trajectory.complete_timesteps):
+                (obs, action, log_prob, reward, val_pred) = timestep
+                reward_tensor = reward.as_tensor(dtype=dtype, device=device)
+                reward_sum += reward_tensor
+                if return_std is not None:
+                    norm_reward_tensor = torch.clamp(
+                        reward_tensor / return_std, min=-10, max=10
+                    )
+                else:
+                    norm_reward_tensor = reward_tensor
+                delta = norm_reward_tensor + gamma * next_val_pred - val_pred
+                next_val_pred = val_pred
+                cur_advantages = delta + gamma * lmbda * cur_advantages
+                cur_return = norm_reward_tensor + gamma * cur_return
+                returns.append(cur_return.detach().item())
+                observations.append((trajectory.agent_id, obs))
+                actions.append(action)
+                log_probs.append(log_prob)
+                values.append(val_pred)
+                advantages.append(cur_advantages)
+
+        if self.standardize_returns:
+            # Update the running statistics about the returns.
+            n_to_increment = min(self.max_returns_per_stats_increment, len(returns))
+            for sample in returns[:n_to_increment]:
+                self.return_stats.update(sample)
+        return (
+            observations,
+            actions,
+            torch.as_tensor(log_probs),
+            torch.as_tensor(values),
+            torch.as_tensor(advantages),
+        )
