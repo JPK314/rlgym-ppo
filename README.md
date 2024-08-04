@@ -1,3 +1,5 @@
+# This repo is archived, development has moved to [rlgym-learn](https://github.com/JPK314/rlgym-learn).
+
 # RLGym-PPO
 A vectorized implementation of PPO for use with [RLGym](rlgym.org).
 
