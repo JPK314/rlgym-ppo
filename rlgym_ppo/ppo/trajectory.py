@@ -5,6 +5,8 @@ import torch
 from rlgym.api import ActionType, AgentID, ObsType, RewardType
 from torch import Tensor
 
+from rlgym_ppo.experience import Timestep
+
 
 class Trajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
     def __init__(self, agent_id: AgentID):
@@ -27,27 +29,22 @@ class Trajectory(Generic[AgentID, ActionType, ObsType, RewardType]):
         self.truncated: Optional[bool] = None
 
     def add_timestep(
-        self,
-        obs: ObsType,
-        action: ActionType,
-        log_prob: Tensor,
-        reward: RewardType,
-        terminated: bool,
-        truncated: bool,
+        self, timestep: Timestep[AgentID, ActionType, ObsType, RewardType]
     ):
-        """
-        :obs: the observation prior to the action taken
-        :action: the action taken as a result of this obs
-        :log_prob: the log prob of this action
-        :reward: the reward resulting from stepping the env with this action from the state used to construct the obs
-        :terminated: whether or not the episode has been terminated
-        :truncated: whether or not the episode has been truncated
-        """
         if not self.done:
-            self.complete_timesteps.append((obs, action, log_prob, reward, None))
-            self.done = terminated or truncated
+            self.complete_timesteps.append(
+                (
+                    timestep.obs,
+                    timestep.action,
+                    timestep.log_prob,
+                    timestep.reward,
+                    None,
+                )
+            )
+            self.final_obs = timestep.next_obs
+            self.done = timestep.terminated or timestep.truncated
             if self.done:
-                self.truncated = truncated
+                self.truncated = timestep.truncated
 
     def update_val_preds(
         self, val_preds: List[Tensor], final_val_pred: Optional[Tensor]

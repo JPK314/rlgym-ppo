@@ -7,7 +7,7 @@ from torch import Tensor
 
 
 # TODO: maybe add ActionParser to constructor?
-class PPOPolicy(nn.Module, Generic[AgentID, ObsType, ActionType]):
+class Actor(nn.Module, Generic[AgentID, ObsType, ActionType]):
     def __init__(self):
         super().__init__()
 

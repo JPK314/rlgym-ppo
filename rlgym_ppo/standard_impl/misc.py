@@ -1,10 +1,12 @@
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 from rlgym.api import ActionType, AgentID, ObsType, RewardType
 
-from rlgym_ppo.api import ObsStandardizer, TrajectoryProcessor
+from rlgym_ppo.api import ObsStandardizer
+from rlgym_ppo.ppo import TrajectoryProcessor
 from rlgym_ppo.util import WelfordRunningStat
 
 
@@ -45,8 +47,18 @@ class NumpyObsStandardizer(ObsStandardizer[AgentID, np.ndarray]):
         ]
 
 
+# TODO: move to ppo
+@dataclass
+class GAETrajectoryProcessorData:
+    average_undiscounted_episodic_return: float
+    average_return: float
+    return_standard_deviation: float
+
+
 class GAETrajectoryProcessor(
-    TrajectoryProcessor[AgentID, ObsType, ActionType, RewardType]
+    TrajectoryProcessor[
+        AgentID, ObsType, ActionType, RewardType, GAETrajectoryProcessorData
+    ]
 ):
     def __init__(
         self,
@@ -98,7 +110,7 @@ class GAETrajectoryProcessor(
                 delta = norm_reward_tensor + gamma * next_val_pred - val_pred
                 next_val_pred = val_pred
                 cur_advantages = delta + gamma * lmbda * cur_advantages
-                cur_return = norm_reward_tensor + gamma * cur_return
+                cur_return = reward_tensor + gamma * cur_return
                 returns.append(cur_return.detach().item())
                 observations.append((trajectory.agent_id, obs))
                 actions.append(action)
@@ -111,10 +123,40 @@ class GAETrajectoryProcessor(
             n_to_increment = min(self.max_returns_per_stats_increment, len(returns))
             for sample in returns[:n_to_increment]:
                 self.return_stats.update(sample)
-        return (
-            observations,
-            actions,
-            torch.as_tensor(log_probs),
-            torch.as_tensor(values),
-            torch.as_tensor(advantages),
+            avg_return = self.return_stats.mean
+            return_std = self.return_stats.std
+        else:
+            avg_return = np.nan
+            return_std = np.nan
+        avg_reward = (reward_sum / len(observations)).cpu().item()
+        trajectory_processor_data = GAETrajectoryProcessorData(
+            average_undiscounted_episodic_return=avg_reward,
+            average_return=avg_return,
+            return_standard_deviation=return_std,
         )
+        return (
+            (
+                observations,
+                actions,
+                torch.cat(log_probs).to(device=device),
+                torch.stack(values).to(device=device),
+                torch.stack(advantages),
+            ),
+            trajectory_processor_data,
+        )
+
+    def save(self) -> dict:
+        return {
+            "gamma": self.gamma,
+            "lambda": self.lmbda,
+            "standardize_returns": self.standardize_returns,
+            "max_returns_per_stats_increment": self.max_returns_per_stats_increment,
+            "return_running_stats": self.return_stats.to_json(),
+        }
+
+    def load(self, state):
+        self.gamma = state["gamma"]
+        self.lmbda = state["lambda"]
+        self.standardize_returns = state["standardize_returns"]
+        self.max_returns_per_stats_increment = state["max_returns_per_stats_increment"]
+        self.return_stats = self.return_stats.from_json(state["return_running_stats"])

@@ -1,2 +1,1 @@
-from .learner import Learner
-from .typing import LearnerConfig, LearnerMetrics
+from .learner import Learner, LearnerConfig

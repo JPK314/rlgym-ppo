@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -6,15 +7,15 @@ from rlgym.rocket_league.api import GameState
 from rlgym.rocket_league.common_values import CAR_MAX_SPEED
 from rlgym.rocket_league.obs_builders import DefaultObs
 
+from rlgym_ppo.ppo import BasicCritic, DiscreteFF, PPOAgent, PPOAgentConfig
 from rlgym_ppo.standard_impl import (
-    BasicActorCriticManager,
-    BasicValueEstimator,
-    DiscreteFF,
     FloatRewardTypeWrapper,
     FloatSerde,
     GAETrajectoryProcessor,
+    HomogeneousTupleSerde,
     NumpyDynamicShapeSerde,
     NumpyObsStandardizer,
+    NumpyStaticShapeSerde,
     PPOMetricsLogger,
     RewardFunctionWrapper,
     RewardTypeWrapperSerde,
@@ -24,34 +25,13 @@ from rlgym_ppo.standard_impl import (
 from rlgym_ppo.util import reporting
 
 
-class ExampleLogger(PPOMetricsLogger[GameState, str, np.ndarray, np.ndarray, float]):
-    def __init__(self):
-        super().__init__(dtype=np.float32)
-
-    def collect_state_metrics(self, state):
-        tot_cars = 0
-        lin_vel_sum = np.zeros(3)
-        ang_vel_sum = np.zeros(3)
-        for car_data in state.cars.values():
-            lin_vel_sum += car_data.physics.linear_velocity
-            ang_vel_sum += car_data.physics.angular_velocity
-            tot_cars += 1
-
-        return [
-            lin_vel_sum / tot_cars,
-            ang_vel_sum / tot_cars,
-        ]
-
+class ExampleLogger(PPOMetricsLogger[Tuple[np.ndarray]]):
     def report_metrics(
-        self,
+        cls,
         collected_state_metrics,
-        ppo_metrics,
-        learner_metrics,
+        agent_metrics,
         wandb_run,
     ):
-        super().report_metrics(
-            collected_state_metrics, ppo_metrics, learner_metrics, wandb_run
-        )
         avg_linvel = np.zeros(3)
         avg_angvel = np.zeros(3)
         for state_metrics in collected_state_metrics:
@@ -66,11 +46,10 @@ class ExampleLogger(PPOMetricsLogger[GameState, str, np.ndarray, np.ndarray, flo
             "angvel_x": avg_angvel[0],
             "angvel_y": avg_angvel[1],
             "angvel_z": avg_angvel[2],
-            **ppo_metrics,
-            **learner_metrics,
+            **agent_metrics,
             "Policy Reward": np.nan,
         }
-        reporting.report_metrics(report, wandb_run=wandb_run)
+        reporting.report_metrics(report, None, wandb_run=wandb_run)
 
 
 class CustomObs(DefaultObs):
@@ -123,18 +102,37 @@ class VelocityPlayerToBallReward(RewardFunction[AgentID, GameState, float]):
         return np.dot(car_to_ball, car.linear_velocity) / CAR_MAX_SPEED
 
 
-def policy_factory(
+def actor_factory(
     obs_space: Tuple[str, int], action_space: Tuple[str, int], device: str
 ):
     return DiscreteFF(obs_space[1], action_space[1], (256, 256, 256), device)
 
 
-def value_net_factory(obs_space: Tuple[str, int], device: str):
-    return BasicValueEstimator(obs_space[1], (256, 256, 256), device)
+def critic_factory(obs_space: Tuple[str, int], device: str):
+    return BasicCritic(obs_space[1], (256, 256, 256), device)
 
 
 def trajectory_processor_factory(**kwargs):
     return GAETrajectoryProcessor(**kwargs)
+
+
+def metrics_logger_factory():
+    return ExampleLogger()
+
+
+def collect_state_metrics_fn(state: GameState):
+    tot_cars = 0
+    lin_vel_sum = np.zeros(3)
+    ang_vel_sum = np.zeros(3)
+    for car_data in state.cars.values():
+        lin_vel_sum += car_data.physics.linear_velocity
+        ang_vel_sum += car_data.physics.angular_velocity
+        tot_cars += 1
+
+    return (
+        lin_vel_sum / tot_cars,
+        ang_vel_sum / tot_cars,
+    )
 
 
 def env_create_function():
@@ -204,41 +202,63 @@ def env_create_function():
 if __name__ == "__main__":
     from rlgym_ppo import Learner, LearnerConfig
 
+    agent_config = PPOAgentConfig(
+        timesteps_per_iteration=10_000,
+        exp_buffer_size=150_000,
+        n_epochs=1,
+        batch_size=10_000,
+        minibatch_size=10_000,
+        ent_coef=0.001,
+        clip_range=0.2,
+        actor_lr=0.0003,
+        critic_lr=0.0003,
+        log_to_wandb=True,
+        load_wandb=True,
+        wandb_project_name=None,
+        wandb_group_name="rlgym-ppo-testing",
+        wandb_run_name=None,
+        save_every_ts=100_000,  # not working yet
+        checkpoints_save_folder=None,  # not working yet
+        add_unix_timestamp=True,  # not working yet
+        checkpoint_load_folder=None,  # not working yet
+        n_checkpoints_to_keep=5,  # not working yet
+        random_seed=123,
+        device="auto",
+        trajectory_processor_args={"standardize_returns": True},
+    )
+    agents = [
+        PPOAgent(
+            actor_factory,
+            critic_factory,
+            trajectory_processor_factory,
+            metrics_logger_factory,
+            config=agent_config,
+        )
+    ]
     # 32 processes
-    n_proc = 64
+    n_proc = 10
 
     # educated guess - could be slightly higher or lower
     min_inference_size = max(1, int(round(n_proc * 0.9)))
     config = LearnerConfig(
         n_proc=n_proc,
         min_inference_size=min_inference_size,
-        ppo_batch_size=50_000,
-        ts_per_iteration=50_000,
-        exp_buffer_size=150_000,
-        ppo_minibatch_size=50_000,
-        ppo_ent_coef=0.001,
-        ppo_epochs=1,
-        save_every_ts=100_000,
-        timestep_limit=1_000_000_000,
-        log_to_wandb=True,
-        wandb_group_name="rlgym-ppo-testing",
         render=False,
-        trajectory_processor_args={"standardize_returns": True},
     )
     learner = Learner(
         env_create_function=env_create_function,
-        actor_critic_manager=BasicActorCriticManager(),
+        agents=agents,
         agent_id_serde=StrSerde(),
         action_type_serde=NumpyDynamicShapeSerde(dtype=np.int64),
         obs_type_serde=NumpyDynamicShapeSerde(dtype=np.float64),
         reward_type_serde=RewardTypeWrapperSerde(FloatRewardTypeWrapper, FloatSerde()),
         obs_space_type_serde=StrIntTupleSerde(),
         action_space_type_serde=StrIntTupleSerde(),
-        policy_factory=policy_factory,
-        value_net_factory=value_net_factory,
-        trajectory_processor_factory=trajectory_processor_factory,
+        state_metrics_type_serde=HomogeneousTupleSerde(
+            NumpyStaticShapeSerde(dtype=np.float64, shape=(3,))
+        ),
+        collect_state_metrics_fn=collect_state_metrics_fn,
         obs_standardizer=NumpyObsStandardizer(5),
-        metrics_logger=ExampleLogger(),
         config=config,
     )
     learner.learn()

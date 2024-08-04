@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 from rlgym.api import AgentID
 
-from rlgym_ppo.api import ValueNet
+from .critic import Critic
 
 
-class BasicValueEstimator(ValueNet[AgentID, np.ndarray]):
+class BasicCritic(Critic[AgentID, np.ndarray]):
     def __init__(self, input_size, layer_sizes, device):
         super().__init__()
         self.device = device

@@ -103,7 +103,6 @@ def pack_header(header_floats: List[float], endian="=") -> bytes:
     return struct.pack(f"{endian}{HEADER_LEN}f", *header_floats)
 
 
-# TODO: switch over to unpack_header
 def unpack_header(message_bytes, endian="=") -> Tuple[List[float], int]:
     return (
         list(struct.unpack(f"{endian}{HEADER_LEN}f", message_bytes[:HEADER_SIZE])),

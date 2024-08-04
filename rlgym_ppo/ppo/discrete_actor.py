@@ -13,10 +13,10 @@ import torch
 import torch.nn as nn
 from rlgym.api import AgentID
 
-from rlgym_ppo.api import PPOPolicy
+from rlgym_ppo.ppo import Actor
 
 
-class DiscreteFF(PPOPolicy[AgentID, np.ndarray, np.ndarray]):
+class DiscreteFF(Actor[AgentID, np.ndarray, np.ndarray]):
     def __init__(self, input_shape, n_actions, layer_sizes, device):
         super().__init__()
         self.device = device

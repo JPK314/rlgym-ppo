@@ -6,7 +6,7 @@ from rlgym.api import AgentID, ObsType
 from torch import Tensor
 
 
-class ValueNet(nn.Module, Generic[AgentID, ObsType]):
+class Critic(nn.Module, Generic[AgentID, ObsType]):
     def __init__(self):
         super().__init__()
 

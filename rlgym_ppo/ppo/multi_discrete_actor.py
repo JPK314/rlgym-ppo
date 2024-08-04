@@ -14,11 +14,11 @@ import torch
 import torch.nn as nn
 from rlgym.api import AgentID
 
-from rlgym_ppo.api import PPOPolicy
+from rlgym_ppo.ppo import Actor
 from rlgym_ppo.util import torch_functions
 
 
-class MultiDiscreteFF(PPOPolicy[AgentID, np.ndarray, np.ndarray]):
+class MultiDiscreteFF(Actor[AgentID, np.ndarray, np.ndarray]):
     def __init__(self, input_shape, layer_sizes, device):
         super().__init__()
         self.device = device

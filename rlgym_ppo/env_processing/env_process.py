@@ -1,25 +1,45 @@
+from typing import Callable, Optional
+
 from rlgym.api import (
     ActionSpaceType,
     ActionType,
     AgentID,
+    EngineActionType,
     ObsSpaceType,
     ObsType,
     RewardType,
+    RLGym,
+    StateType,
 )
 
-from rlgym_ppo.api import TypeSerde
+from rlgym_ppo.api import StateMetrics, TypeSerde
 from rlgym_ppo.util.comm_consts import PACKET_MAX_SIZE
 
 
-def batched_agent_process(
+def env_process(
     proc_id,
     endpoint,
+    build_env_fn: Callable[
+        [],
+        RLGym[
+            AgentID,
+            ObsType,
+            ActionType,
+            EngineActionType,
+            RewardType,
+            StateType,
+            ObsSpaceType,
+            ActionSpaceType,
+        ],
+    ],
     agent_id_serde: TypeSerde[AgentID],
     action_type_serde: TypeSerde[ActionType],
     obs_type_serde: TypeSerde[ObsType],
     reward_type_serde: TypeSerde[RewardType],
     action_space_type_serde: TypeSerde[ActionSpaceType],
     obs_space_type_serde: TypeSerde[ObsSpaceType],
+    state_metrics_type_serde: Optional[TypeSerde[StateMetrics]],
+    collect_state_metrics_fn: Callable[[StateType], StateMetrics],
     shm_buffer,
     shm_offset: int,
     shm_size: int,
@@ -42,22 +62,12 @@ def batched_agent_process(
     :return: None
     """
 
-    import pickle
     import socket
     import time
-    from typing import Callable, Generic, List, Union
 
     import numpy as np
-    from rlgym.api import (
-        ActionSpaceType,
-        EngineActionType,
-        ObsSpaceType,
-        RLGym,
-        StateType,
-    )
 
     from rlgym_ppo.util import comm_consts
-    from rlgym_ppo.util.comm_consts import BOOL_SIZE, INTEGER_SIZE
 
     if render:
         try:
@@ -71,7 +81,6 @@ def batched_agent_process(
                 return False
 
     env = None
-    metrics_encoding_function = None
     shm_view = np.frombuffer(
         buffer=shm_buffer,
         dtype=np.byte,
@@ -92,26 +101,7 @@ def batched_agent_process(
     pipe.bind(("127.0.0.1", 0))
     pipe.sendto(b"0", endpoint)
 
-    # Wait for initialization data from the learner.
-    while env is None:
-        data = pickle.loads(pipe.recv(PACKET_MAX_SIZE))
-        if data[0] == "initialization_data":
-            build_env_fn: Callable[
-                [],
-                RLGym[
-                    AgentID,
-                    ObsType,
-                    ActionType,
-                    EngineActionType,
-                    RewardType,
-                    StateType,
-                    ObsSpaceType,
-                    ActionSpaceType,
-                ],
-            ] = data[1]
-            metrics_encoding_function: Callable[[StateType], np.ndarray] = data[2]
-
-            env = build_env_fn()
+    env = build_env_fn()
 
     reset_obs = env.reset()
     agent_id_ordering = {idx: agent_id for (idx, agent_id) in enumerate(env.agents)}
@@ -125,21 +115,18 @@ def batched_agent_process(
     persistent_truncated_dict = {agent_id: False for agent_id in env.agents}
     persistent_terminated_dict = {agent_id: False for agent_id in env.agents}
     n_agents = len(env.agents)
-    # TODO: pack directly into shm_view
-    obs_buffer = comm_consts.pack_int(n_agents)
-    for agent_id, obs in reset_obs.items():
-        agent_id_bytes = serialized_agent_ids[agent_id]
-        obs_bytes = obs_type_serde.to_bytes(obs)
-        obs_buffer += comm_consts.pack_int(len(agent_id_bytes))
-        obs_buffer += agent_id_bytes
-        obs_buffer += comm_consts.pack_int(len(obs_bytes))
-        obs_buffer += obs_bytes
-
-    obs_buffer_array = np.frombuffer(obs_buffer, dtype=np.byte)
-    assert (
-        obs_buffer_array.size <= shm_size
-    ), "ATTEMPTED TO CREATE AGENT MESSAGE BUFFER LARGER THAN MAXIMUM ALLOWED SIZE"
-    shm_view[: obs_buffer_array.size] = obs_buffer_array
+    offset = 0
+    offset = comm_consts.append_int(shm_view, offset, n_agents, shm_size)
+    for agent_id, serialized_agent_id in serialized_agent_ids.items():
+        offset = comm_consts.append_bytes(
+            shm_view, offset, serialized_agent_id, shm_size
+        )
+        offset = comm_consts.append_bytes(
+            shm_view,
+            offset,
+            obs_type_serde.to_bytes(reset_obs[agent_id]),
+            shm_size,
+        )
     packed_message_floats = comm_consts.pack_header(comm_consts.ENV_RESET_STATE_HEADER)
     pipe.sendto(packed_message_floats, endpoint)
 
@@ -170,6 +157,15 @@ def batched_agent_process(
                 obs_dict, rew_dict, terminated_dict, truncated_dict = env.step(
                     actions_dict
                 )
+
+                if (
+                    collect_state_metrics_fn is not None
+                    and state_metrics_type_serde is not None
+                ):
+                    metrics_bytes = state_metrics_type_serde.to_bytes(
+                        collect_state_metrics_fn(env.state)
+                    )
+
                 for agent_id in env.agents:
                     if (
                         persistent_terminated_dict[agent_id]
@@ -295,8 +291,10 @@ def batched_agent_process(
                             shm_size,
                         )
 
-                if metrics_encoding_function is not None:
-                    metrics_bytes = metrics_encoding_function(env.state)
+                if (
+                    collect_state_metrics_fn is not None
+                    and state_metrics_type_serde is not None
+                ):
                     offset = comm_consts.append_bytes(
                         shm_view, offset, metrics_bytes, shm_size
                     )

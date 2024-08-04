@@ -1,25 +1,56 @@
 import os
 import time
+from dataclasses import dataclass
 from typing import Callable, Generic, Optional
 
 import numpy as np
 import torch
-from rlgym.api import ActionSpaceType, ActionType, AgentID, ObsSpaceType, ObsType
+from rlgym.api import (
+    ActionSpaceType,
+    ActionType,
+    AgentID,
+    ObsSpaceType,
+    ObsType,
+    RewardType,
+)
 from torch import nn as nn
 
-from rlgym_ppo.api import PPOPolicy, ValueNet
-from rlgym_ppo.experience import ExperienceBuffer
-from rlgym_ppo.ppo import PPOMetrics
+from .actor import Actor
+from .critic import Critic
+from .experience_buffer import ExperienceBuffer
+from .trajectory_processing import TrajectoryProcessorData
 
 
-class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpaceType]):
+@dataclass
+class PPOData:
+    batch_consumption_time: float
+    cumulative_model_updates: int
+    actor_entropy: float
+    kl_divergence: float
+    critic_loss: float
+    sb3_clip_fraction: float
+    actor_update_magnitude: float
+    critic_update_magnitude: float
+
+
+class PPOLearner(
+    Generic[
+        AgentID,
+        ObsType,
+        ActionType,
+        RewardType,
+        ActionSpaceType,
+        ObsSpaceType,
+        TrajectoryProcessorData,
+    ]
+):
     def __init__(
         self,
-        policy: PPOPolicy[AgentID, ObsType, ActionType],
-        value_net: ValueNet[AgentID, ObsType],
+        actor: Actor[AgentID, ObsType, ActionType],
+        critic: Critic[AgentID, ObsType],
         batch_size,
         n_epochs,
-        policy_lr,
+        actor_lr,
         critic_lr,
         clip_range,
         ent_coef,
@@ -31,38 +62,36 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         assert (
             batch_size % mini_batch_size == 0
         ), "MINIBATCH SIZE MUST BE AN INTEGER MULTIPLE OF BATCH SIZE"
-        self.policy = policy
-        self.value_net = value_net
+        self.actor = actor
+        self.critic = critic
         self.mini_batch_size = mini_batch_size
 
-        self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=policy_lr)
-        self.value_optimizer = torch.optim.Adam(
-            self.value_net.parameters(), lr=critic_lr
-        )
-        self.value_loss_fn = torch.nn.MSELoss()
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.critic_loss_fn = torch.nn.MSELoss()
 
         # Calculate parameter counts
-        policy_params = self.policy.parameters()
-        critic_params = self.value_net.parameters()
+        actor_params = self.actor.parameters()
+        critic_params = self.critic.parameters()
 
-        trainable_policy_parameters = filter(lambda p: p.requires_grad, policy_params)
-        policy_params_count = sum(p.numel() for p in trainable_policy_parameters)
+        trainable_actor_parameters = filter(lambda p: p.requires_grad, actor_params)
+        actor_params_count = sum(p.numel() for p in trainable_actor_parameters)
 
         trainable_critic_parameters = filter(lambda p: p.requires_grad, critic_params)
         critic_params_count = sum(p.numel() for p in trainable_critic_parameters)
 
-        total_parameters = policy_params_count + critic_params_count
+        total_parameters = actor_params_count + critic_params_count
 
         # Display in a structured manner
         print("Trainable Parameters:")
         print(f"{'Component':<10} {'Count':<10}")
         print("-" * 20)
-        print(f"{'Policy':<10} {policy_params_count:<10}")
+        print(f"{'Policy':<10} {actor_params_count:<10}")
         print(f"{'Critic':<10} {critic_params_count:<10}")
         print("-" * 20)
         print(f"{'Total':<10} {total_parameters:<10}")
 
-        print(f"Current Policy Learning Rate: {policy_lr}")
+        print(f"Current Policy Learning Rate: {actor_lr}")
         print(f"Current Critic Learning Rate: {critic_lr}")
 
         self.n_epochs = n_epochs
@@ -73,8 +102,9 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
 
     def learn(
         self,
-        exp: ExperienceBuffer[AgentID, ObsType, ActionType],
-        collect_metrics_fn: Optional[Callable[[PPOMetrics], None]],
+        exp: ExperienceBuffer[
+            AgentID, ObsType, ActionType, RewardType, TrajectoryProcessorData
+        ],
     ):
         """
         Compute PPO updates with an experience buffer.
@@ -92,11 +122,11 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         clip_fractions = []
 
         # Save parameters before computing any updates.
-        policy_before = torch.nn.utils.parameters_to_vector(
-            self.policy.parameters()
+        actor_before = torch.nn.utils.parameters_to_vector(
+            self.actor.parameters()
         ).cpu()
         critic_before = torch.nn.utils.parameters_to_vector(
-            self.value_net.parameters()
+            self.critic.parameters()
         ).cpu()
 
         t1 = time.time()
@@ -112,8 +142,8 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                     batch_advantages,
                 ) = batch
                 batch_target_values = batch_values + batch_advantages
-                self.policy_optimizer.zero_grad()
-                self.value_optimizer.zero_grad()
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
 
                 for minibatch_slice in range(0, self.batch_size, self.mini_batch_size):
                     # Send everything to the device and enforce correct shapes.
@@ -127,10 +157,10 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                     target_values = batch_target_values[start:stop].to(self.device)
 
                     # Compute value estimates.
-                    vals = self.value_net(obs).view_as(target_values)
+                    vals = self.critic(obs).view_as(target_values)
 
-                    # Get policy log probs & entropy.
-                    log_probs, entropy = self.policy.get_backprop_data(obs, acts)
+                    # Get actor log probs & entropy.
+                    log_probs, entropy = self.actor.get_backprop_data(obs, acts)
                     log_probs = log_probs.view_as(old_probs)
 
                     # Compute PPO loss.
@@ -153,12 +183,12 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                         )
                         clip_fractions.append(clip_fraction)
 
-                    policy_loss = -torch.min(
+                    actor_loss = -torch.min(
                         ratio * advantages, clipped * advantages
                     ).mean()
-                    value_loss = self.value_loss_fn(vals, target_values)
+                    value_loss = self.critic_loss_fn(vals, target_values)
                     ppo_loss = (
-                        (policy_loss - entropy * self.ent_coef)
+                        (actor_loss - entropy * self.ent_coef)
                         * self.mini_batch_size
                         / self.batch_size
                     )
@@ -171,13 +201,11 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
                     mean_entropy += entropy.cpu().detach().item()
                     n_minibatch_iterations += 1
 
-                torch.nn.utils.clip_grad_norm_(
-                    self.value_net.parameters(), max_norm=0.5
-                )
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
 
-                self.policy_optimizer.step()
-                self.value_optimizer.step()
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
 
                 n_iterations += 1
 
@@ -196,46 +224,41 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
         else:
             mean_clip = np.mean(clip_fractions)
 
-        # Compute magnitude of updates made to the policy and value estimator.
-        policy_after = torch.nn.utils.parameters_to_vector(
-            self.policy.parameters()
-        ).cpu()
+        # Compute magnitude of updates made to the actor and critic.
+        actor_after = torch.nn.utils.parameters_to_vector(self.actor.parameters()).cpu()
         critic_after = torch.nn.utils.parameters_to_vector(
-            self.value_net.parameters()
+            self.critic.parameters()
         ).cpu()
-        policy_update_magnitude = (policy_before - policy_after).norm().item()
+        actor_update_magnitude = (actor_before - actor_after).norm().item()
         critic_update_magnitude = (critic_before - critic_after).norm().item()
 
-        self.policy_optimizer.zero_grad()
-        self.value_optimizer.zero_grad()
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
 
         self.cumulative_model_updates += n_iterations
-        if collect_metrics_fn is not None:
-            collect_metrics_fn(
-                PPOMetrics(
-                    (time.time() - t1) / n_iterations,
-                    self.cumulative_model_updates,
-                    mean_entropy,
-                    mean_divergence,
-                    mean_val_loss,
-                    mean_clip,
-                    policy_update_magnitude,
-                    critic_update_magnitude,
-                )
-            )
+        return PPOData(
+            (time.time() - t1) / n_iterations,
+            self.cumulative_model_updates,
+            mean_entropy,
+            mean_divergence,
+            mean_val_loss,
+            mean_clip,
+            actor_update_magnitude,
+            critic_update_magnitude,
+        )
 
     def save_to(self, folder_path):
         os.makedirs(folder_path, exist_ok=True)
-        torch.save(self.policy.state_dict(), os.path.join(folder_path, "PPO_POLICY.pt"))
+        torch.save(self.actor.state_dict(), os.path.join(folder_path, "PPO_POLICY.pt"))
         torch.save(
-            self.value_net.state_dict(), os.path.join(folder_path, "PPO_VALUE_NET.pt")
+            self.critic.state_dict(), os.path.join(folder_path, "PPO_VALUE_NET.pt")
         )
         torch.save(
-            self.policy_optimizer.state_dict(),
+            self.actor_optimizer.state_dict(),
             os.path.join(folder_path, "PPO_POLICY_OPTIMIZER.pt"),
         )
         torch.save(
-            self.value_optimizer.state_dict(),
+            self.critic_optimizer.state_dict(),
             os.path.join(folder_path, "PPO_VALUE_NET_OPTIMIZER.pt"),
         )
 
@@ -244,15 +267,15 @@ class PPOLearner(Generic[AgentID, ObsType, ActionType, ActionSpaceType, ObsSpace
             folder_path
         )
 
-        self.policy.load_state_dict(
+        self.actor.load_state_dict(
             torch.load(os.path.join(folder_path, "PPO_POLICY.pt"))
         )
-        self.value_net.load_state_dict(
+        self.critic.load_state_dict(
             torch.load(os.path.join(folder_path, "PPO_VALUE_NET.pt"))
         )
-        self.policy_optimizer.load_state_dict(
+        self.actor_optimizer.load_state_dict(
             torch.load(os.path.join(folder_path, "PPO_POLICY_OPTIMIZER.pt"))
         )
-        self.value_optimizer.load_state_dict(
+        self.critic_optimizer.load_state_dict(
             torch.load(os.path.join(folder_path, "PPO_VALUE_NET_OPTIMIZER.pt"))
         )

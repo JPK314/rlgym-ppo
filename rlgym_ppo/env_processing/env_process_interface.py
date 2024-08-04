@@ -13,21 +13,14 @@ import pickle
 import selectors
 import socket
 import time
-from typing import Callable, Dict, Generic
+from typing import Callable, Dict, Generic, cast
 
 import numpy as np
 import torch
 from numpy import frombuffer
 
-from rlgym_ppo.api import (
-    ActorCriticManager,
-    ObsStandardizer,
-    PPOPolicy,
-    TypeSerde,
-    ValueNet,
-)
-from rlgym_ppo.batched_agents import BatchedTrajectory, Trajectory
-from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
+from rlgym_ppo.api import ObsStandardizer, TypeSerde
+from rlgym_ppo.env_processing.env_process import env_process
 from rlgym_ppo.util import comm_consts
 from rlgym_ppo.util.comm_consts import PACKET_MAX_SIZE
 
@@ -40,6 +33,7 @@ except ImportError:
 
 
 from typing import Any, List, Optional, Tuple
+from uuid import UUID, uuid4
 
 from rlgym.api import (
     ActionSpaceType,
@@ -52,9 +46,13 @@ from rlgym.api import (
     RLGym,
     StateType,
 )
+from torch import Tensor
+
+from rlgym_ppo.api import StateMetrics
+from rlgym_ppo.experience import Timestep
 
 
-class BatchedAgentManager(
+class EnvProcessInterface(
     Generic[
         AgentID,
         ObsType,
@@ -64,6 +62,7 @@ class BatchedAgentManager(
         StateType,
         ObsSpaceType,
         ActionSpaceType,
+        StateMetrics,
     ]
 ):
     def __init__(
@@ -81,14 +80,14 @@ class BatchedAgentManager(
                 ActionSpaceType,
             ],
         ],
-        actor_critic_manager: ActorCriticManager,
         agent_id_serde: TypeSerde[AgentID],
         action_type_serde: TypeSerde[ActionType],
         obs_type_serde: TypeSerde[ObsType],
         reward_type_serde: TypeSerde[RewardType],
         obs_space_type_serde: TypeSerde[ObsSpaceType],
         action_space_type_serde: TypeSerde[ActionSpaceType],
-        decode_state_metrics_fn: Optional[Callable[[bytes], List[np.ndarray]]] = None,
+        state_metrics_type_serde: Optional[TypeSerde[StateMetrics]] = None,
+        collect_state_metrics_fn: Optional[Callable[[StateType], bytes]] = None,
         obs_standardizer: Optional[ObsStandardizer[AgentID, ObsType]] = None,
         min_inference_size=8,
         seed=123,
@@ -106,10 +105,10 @@ class BatchedAgentManager(
         self.reward_type_serde = reward_type_serde
         self.action_space_type_serde = action_space_type_serde
         self.obs_space_type_serde = obs_space_type_serde
+        self.state_metrics_type_serde = state_metrics_type_serde
+        self.collect_state_metrics_fn = collect_state_metrics_fn
 
-        self.actor_critic_manager = actor_critic_manager
         self.obs_standardizer = obs_standardizer
-        self.decode_state_metrics_fn = decode_state_metrics_fn
 
         self.current_obs: List[Dict[AgentID, ObsType]] = []
         self.current_actions: List[Dict[AgentID, ActionType]] = []
@@ -119,9 +118,8 @@ class BatchedAgentManager(
         self.cumulative_timesteps = 0
         self.min_inference_size = min_inference_size
 
-        self.trajectory_map: List[BatchedTrajectory] = []
+        self.trajectory_id_map: List[Dict[AgentID, UUID]]
         self.prev_time = 0
-        self.completed_trajectories: List[BatchedTrajectory] = []
 
         self.recalculate_agent_id_every_step = recalculate_agent_id_every_step
 
@@ -131,90 +129,16 @@ class BatchedAgentManager(
             comm_consts.POLICY_ACTIONS_HEADER
         )
 
-    def collect_timesteps(self, n) -> Tuple[
-        List[Trajectory[AgentID, ActionType, ObsType, RewardType]],
-        List[np.ndarray],
-        int,
-        float,
-    ]:
-        """
-        Collect a specified number of timesteps from the environment.
-
-        :param n: Number of timesteps to collect.
-        :return: A tuple containing the collected timesteps and additional information.
-                - A list of trajectories to be used for learning
-                - A list of metrics
-                - Number of timesteps collected
-                - Time spent inside this method
-        """
-
-        t1 = time.perf_counter()
-        trajectories: List[Trajectory] = []
-
-        n_collected = 0
-        n_procs = max(1, len(self.processes))
-        n_obs_per_inference = min(self.min_inference_size, n_procs)
-        collected_metrics = []
-        # Collect n timesteps.
-        while n_collected < n:
-            # Send actions for the current observations and collect new states to act on. Note that the next states
-            # will not necessarily be from the environments that we just sent actions to. Whatever timestep data happens
-            # to be lying around in the buffer will be collected and used in the next inference step.
-
-            self._send_actions()
-            (
-                collected_metrics_this_pass,
-                n_collected_this_pass,
-            ) = self._collect_responses(n_obs_per_inference)
-            n_collected += n_collected_this_pass
-            collected_metrics += collected_metrics_this_pass
-
-        # Organize our new timesteps into the appropriate lists.
-        for proc_id, batched_trajectory in enumerate(self.trajectory_map):
-            batched_trajectory.add_last_obs(self.current_obs[proc_id])
-            self.completed_trajectories.append(batched_trajectory)
-            self.trajectory_map[proc_id] = BatchedTrajectory(
-                batched_trajectory.agent_trajectories.keys()
-            )
-
-        for batched_trajectory in self.completed_trajectories:
-            trajectories += [
-                trajectory
-                for trajectory in batched_trajectory.get_all()
-                if not self.actor_critic_manager.should_discard(trajectory.agent_id)
-            ]
-
-        self.cumulative_timesteps += n_collected
-        t2 = time.perf_counter()
-        self.completed_trajectories = []
-
-        return (
-            trajectories,
-            collected_metrics,
-            n_collected,
-            t2 - t1,
+    def collect_step_data(self):
+        (timesteps, observations, state_metrics) = self._collect_responses(
+            self.min_inference_size
+        )
+        pids, obs_dict_list = cast(
+            Tuple[List[int], List[Dict[AgentID, ObsType]]], zip(*observations)
         )
 
-    @torch.no_grad()
-    def _send_actions(self):
-        """
-        Send actions to environment processes based on current observations.
-        """
-        if len(self.current_pids) == 0:
-            return
-
-        obs_dict_list: List[Dict[AgentID, ObsType]] = []
-        pids: List[int] = []
-        for proc_id in self.current_pids:
-            o = self.current_obs[proc_id]
-            if o is None:
-                continue
-
-            obs_dict_list.append(o)
-            pids.append(proc_id)
-
         if not obs_dict_list:
-            return
+            return None
 
         # Tricky bookkeeping. We can only assume agent ids are distinct within a proc_id
         obs_list: List[Tuple[AgentID, ObsType]] = []
@@ -224,17 +148,29 @@ class BatchedAgentManager(
                 obs_list.append((agent_id, obs))
                 index_list.append((pid_idx, agent_id))
 
-        actions, log_probs = self.policy.get_action(obs_list)
+        self.index_list = index_list
+        self.current_pids = pids
+
+        return obs_list, timesteps, state_metrics
+
+    def send_actions(self, actions: List[ActionType], log_probs: Tensor):
+        """
+        Send actions to environment processes based on current observations.
+        """
 
         # convert back list of dicts
-        action_dict_list: List[Dict[AgentID, ActionType]] = [{} for _ in pids]
-        log_prob_dict_list: List[Dict[AgentID, torch.Tensor]] = [{} for _ in pids]
+        action_dict_list: List[Dict[AgentID, ActionType]] = [
+            {} for _ in self.current_pids
+        ]
+        log_prob_dict_list: List[Dict[AgentID, torch.Tensor]] = [
+            {} for _ in self.current_pids
+        ]
         for idx, action in enumerate(actions):
-            (pid_idx, agent_id) = index_list[idx]
+            (pid_idx, agent_id) = self.index_list[idx]
             action_dict_list[pid_idx][agent_id] = action
             log_prob_dict_list[pid_idx][agent_id] = log_probs[idx]
 
-        for pid_idx, proc_id in enumerate(pids):
+        for pid_idx, proc_id in enumerate(self.current_pids):
             process, parent_end, child_endpoint, shm_view = self.processes[proc_id]
             pid_actions = action_dict_list[pid_idx]
             actions_bytes = self.packed_actions_header
@@ -255,15 +191,19 @@ class BatchedAgentManager(
 
         self.current_pids = []
 
-    def _collect_responses(self, n_obs_per_inference):
+    def _collect_responses(
+        self, n_obs_per_inference
+    ) -> Tuple[
+        List[Timestep], List[Tuple[int, Dict[AgentID, ObsType]]], List[List[np.ndarray]]
+    ]:
         """
         Collect responses from environment processes and update trajectory data.
         :return: Number of responses collected.
         """
-
         n_collected = 0
-        collected_metrics = []
-
+        collected_timesteps: List[Timestep] = []
+        observations: List[Tuple[int, Dict[AgentID, ObsType]]] = []
+        collected_metrics: List[List[np.ndarray]] = []
         while n_collected < n_obs_per_inference:
             for key, event in self.selector.select():
                 if not (event & selectors.EVENT_READ):
@@ -271,26 +211,36 @@ class BatchedAgentManager(
 
                 parent_end, fd, events, proc_id = key
                 process, parent_end, child_endpoint, shm_view = self.processes[proc_id]
-                n_collected += self._collect_response(
-                    proc_id, parent_end, shm_view, collected_metrics
-                )
-                # print(n_collected, "|", len(collected_metrics))
+                response = self._collect_response(proc_id, parent_end, shm_view)
+                if response is not None:
+                    timesteps, obs_from_process, metrics_from_process = response
+                    collected_timesteps += timesteps
+                    n_collected += len(timesteps)
+                    observations.append((proc_id, obs_from_process))
+                    if metrics_from_process is not None:
+                        collected_metrics.append(metrics_from_process)
 
-        return collected_metrics, n_collected
+        return timesteps, observations, collected_metrics
 
     def _collect_response(
         self,
         proc_id: int,
         parent_end,
         shm_view: np.ndarray,
-        collected_metrics: List[np.ndarray],
-    ):
+    ) -> Optional[
+        Tuple[
+            List[Timestep],
+            Dict[AgentID, ObsType],
+            Optional[List[np.ndarray]],
+        ]
+    ]:
         socket_data = parent_end.recv(PACKET_MAX_SIZE)
         (header, _) = comm_consts.unpack_header(socket_data)
         if header[0] != comm_consts.ENV_STEP_DATA_HEADER[0]:
-            return 0
+            return None
 
         offset = 0
+        agent_ids: List[AgentID] = []
         new_episode_agent_ids: List[AgentID] = []
         obs_dict: Dict[AgentID, ObsType] = {}
         new_episode_obs_dict: Dict[AgentID, ObsType] = {}
@@ -301,12 +251,11 @@ class BatchedAgentManager(
         new_episode_truncated_dict: Dict[AgentID, bool] = {}
         (new_episode, offset) = comm_consts.retrieve_bool(shm_view, offset)
         if new_episode:
-            # TODO: raise error if prev_n_agents = 0? Somewhere?
             (prev_n_agents, offset) = comm_consts.retrieve_int(shm_view, offset)
-            n_collected = prev_n_agents
             for _ in range(prev_n_agents):
                 (agent_id_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
                 agent_id = self.agent_id_serde.from_bytes(agent_id_bytes)
+                agent_ids.append(agent_id)
                 (obs_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
                 obs_dict[agent_id] = self.obs_type_serde.from_bytes(obs_bytes)
                 (rew_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
@@ -329,10 +278,10 @@ class BatchedAgentManager(
                 new_episode_truncated_dict[agent_id] = False
         else:
             (n_agents, offset) = comm_consts.retrieve_int(shm_view, offset)
-            n_collected = n_agents
             for _ in range(n_agents):
                 (agent_id_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
                 agent_id = self.agent_id_serde.from_bytes(agent_id_bytes)
+                agent_ids.append(agent_id)
                 (obs_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
                 obs_dict[agent_id] = self.obs_type_serde.from_bytes(obs_bytes)
                 (rew_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
@@ -342,11 +291,14 @@ class BatchedAgentManager(
                 (truncated, offset) = comm_consts.retrieve_bool(shm_view, offset)
                 truncated_dict[agent_id] = truncated
 
-        if self.decode_state_metrics_fn is not None:
+        if (
+            self.state_metrics_type_serde is not None
+            and self.collect_state_metrics_fn is not None
+        ):
             (metrics_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
-            metrics = self.decode_state_metrics_fn(metrics_bytes)
-
-        collected_metrics.append(metrics)
+            metrics = self.state_metrics_type_serde.from_bytes(metrics_bytes)
+        else:
+            metrics = None
 
         if proc_id not in self.current_pids:
             self.current_pids.append(proc_id)
@@ -359,36 +311,36 @@ class BatchedAgentManager(
                 )
             }
 
+        timesteps: List[Timestep] = []
+        for agent_id in agent_ids:
+            timesteps.append(
+                Timestep(
+                    self.trajectory_id_map[proc_id][agent_id],
+                    agent_id,
+                    self.current_obs[proc_id][agent_id],
+                    obs_dict[agent_id],
+                    self.current_actions[proc_id][agent_id],
+                    self.current_log_probs[proc_id][agent_id],
+                    rew_dict[agent_id],
+                    terminated_dict[agent_id],
+                    truncated_dict[agent_id],
+                )
+            )
         if new_episode:
-            self.trajectory_map[proc_id].add_timesteps(
-                self.current_obs[proc_id],
-                self.current_actions[proc_id],
-                self.current_log_probs[proc_id],
-                rew_dict,
-                terminated_dict,
-                truncated_dict,
-            )
-            self.trajectory_map[proc_id].add_last_obs(obs_dict)
-            self.completed_trajectories.append(self.trajectory_map[proc_id])
-            self.trajectory_map[proc_id] = BatchedTrajectory(new_episode_agent_ids)
+            self.trajectory_id_map[proc_id].clear()
+            for agent_id in new_episode_agent_ids:
+                self.trajectory_id_map[proc_id][agent_id] = uuid4()
+
+            self.current_obs[proc_id] = new_episode_obs_dict
         else:
-            self.trajectory_map[proc_id].add_timesteps(
-                self.current_obs[proc_id],
-                self.current_actions[proc_id],
-                self.current_log_probs[proc_id],
-                rew_dict,
-                terminated_dict,
-                truncated_dict,
-            )
+            self.current_obs[proc_id] = obs_dict
 
-        self.current_obs[proc_id] = obs_dict
+        return timesteps, obs_dict, metrics
 
-        return n_collected
-
-    def _get_initial_obs(self):
+    def _get_initial_obs(self) -> List[Tuple[AgentID, ObsType]]:
         """
         Retrieve initial observations from environment processes.
-        :return: None.
+        :return: List of initial observations.
         """
 
         self.current_pids = []
@@ -412,9 +364,25 @@ class BatchedAgentManager(
                     (obs_bytes, offset) = comm_consts.retrieve_bytes(shm_view, offset)
                     obs = self.obs_type_serde.from_bytes(obs_bytes)
                     obs_dict[agent_id] = obs
-                self.trajectory_map[proc_id] = BatchedTrajectory(new_episode_agent_ids)
+                    self.trajectory_id_map[proc_id][agent_id] = uuid4()
                 self.current_obs[proc_id] = obs_dict
 
+        obs_dict_list = self.current_obs
+
+        # Tricky bookkeeping. We can only assume agent ids are distinct within a proc_id
+        obs_list: List[Tuple[AgentID, ObsType]] = []
+        index_list: List[Tuple[int, AgentID]] = []
+        for pid_idx, obs_dict in enumerate(obs_dict_list):
+            for agent_id, obs in obs_dict.items():
+                obs_list.append((agent_id, obs))
+                index_list.append((pid_idx, agent_id))
+
+        self.index_list = index_list
+        self.current_pids = list(range(len(self.processes)))
+
+        return obs_list
+
+    # TODO: return one per agent?
     def _get_space_types(self) -> Tuple[ObsSpaceType, ActionSpaceType]:
         """
         Retrieve environment observation and action space shapes from one of the connected environment processes.
@@ -444,19 +412,12 @@ class BatchedAgentManager(
 
     def init_processes(
         self,
-        policy_factory: Callable[
-            [ObsSpaceType, ActionSpaceType, str],
-            PPOPolicy[AgentID, ObsType, ActionType],
-        ],
-        value_net_factory: Callable[[ObsSpaceType, str], ValueNet[AgentID, ObsType]],
-        device: str,
         n_processes: int,
-        encode_state_metrics_fn: Optional[Callable[[StateType], bytes]] = None,
         spawn_delay=None,
         render=False,
         render_delay: Optional[float] = None,
         shm_buffer_size=8192,
-    ) -> Tuple[PPOPolicy[AgentID, ObsType, ActionType], ValueNet[AgentID, ObsType]]:
+    ) -> Tuple[ObsSpaceType, ActionSpaceType, List[Tuple[AgentID, ObsType]]]:
         """
         Initialize and spawn environment processes.
         :param n_processes: Number of processes to spawn.
@@ -473,6 +434,7 @@ class BatchedAgentManager(
         start_method = "forkserver" if can_fork else "spawn"
         context = mp.get_context(start_method)
         self.n_procs = n_processes
+        self.min_inference_size = min(self.min_inference_size, n_processes)
 
         import multiprocessing.sharedctypes
 
@@ -481,7 +443,7 @@ class BatchedAgentManager(
             "b", n_processes * self.shm_size
         )
         self.processes = [None for i in range(n_processes)]
-        self.trajectory_map = [None for i in range(n_processes)]
+        self.trajectory_id_map = [{} for _ in range(n_processes)]
 
         self.current_obs: List[Optional[Dict[AgentID, ObsType]]] = [
             None for i in range(n_processes)
@@ -504,16 +466,19 @@ class BatchedAgentManager(
             shm_offset = proc_id * self.shm_size
 
             process = context.Process(
-                target=batched_agent_process,
+                target=env_process,
                 args=(
                     proc_id,
                     parent_end.getsockname(),
+                    self.build_env_fn,
                     self.agent_id_serde,
                     self.action_type_serde,
                     self.obs_type_serde,
                     self.reward_type_serde,
                     self.action_space_type_serde,
                     self.obs_space_type_serde,
+                    self.state_metrics_type_serde,
+                    self.collect_state_metrics_fn,
                     self.shm_buffer,
                     shm_offset,
                     self.shm_size,
@@ -546,17 +511,11 @@ class BatchedAgentManager(
             if spawn_delay is not None:
                 time.sleep(spawn_delay)
 
-            p = pickle.dumps(
-                ("initialization_data", self.build_env_fn, encode_state_metrics_fn)
-            )
-            parent_end.sendto(p, child_endpoint)
-
             self.processes[proc_id] = (process, parent_end, child_endpoint, shm_view)
 
-        self._get_initial_obs()
-        (obs_space, action_space) = self._get_space_types()
-        self.policy = policy_factory(obs_space, action_space, device)
-        return (self.policy, value_net_factory(obs_space, device))
+        obs_list = self._get_initial_obs()
+        obs_space, action_space = self._get_space_types()
+        return (obs_space, action_space, obs_list)
 
     def cleanup(self):
         """

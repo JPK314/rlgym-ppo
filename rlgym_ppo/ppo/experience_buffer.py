@@ -15,11 +15,13 @@ import numpy as np
 import torch
 from rlgym.api import ActionType, AgentID, ObsType, RewardType
 
-from rlgym_ppo.api import TrajectoryProcessor
-from rlgym_ppo.experience import Trajectory
+from .trajectory import Trajectory
+from .trajectory_processing import TrajectoryProcessor, TrajectoryProcessorData
 
 
-class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
+class ExperienceBuffer(
+    Generic[AgentID, ObsType, ActionType, RewardType, TrajectoryProcessorData]
+):
     @staticmethod
     def _cat(t1, t2, size):
         t2_len = len(t2)
@@ -60,7 +62,7 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
     def __init__(
         self,
         trajectory_processor: TrajectoryProcessor[
-            AgentID, ObsType, ActionType, RewardType
+            AgentID, ObsType, ActionType, RewardType, TrajectoryProcessorData
         ],
         max_size,
         seed,
@@ -80,7 +82,7 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
     # TODO: update docs
     def submit_experience(
         self, trajectories: List[Trajectory[AgentID, ActionType, ObsType, RewardType]]
-    ):
+    ) -> TrajectoryProcessorData:
         """
         Function to add experience to the buffer.
 
@@ -93,16 +95,17 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
         :param values: The output of the value function estimator evaluated on the observations.
         :param advantages: The advantage of each action at each state in `states` and `actions`
 
-        :return: None
+        :return: TrajectoryProcessorData
         """
 
         _cat = ExperienceBuffer._cat
         _cat_list = ExperienceBuffer._cat_list
-        (observations, actions, log_probs, values, advantages) = (
+        exp_buffer_data, trajectory_processor_data = (
             self.trajectory_processor.process_trajectories(
                 trajectories, dtype=torch.float32, device=self.device
             )
         )
+        (observations, actions, log_probs, values, advantages) = exp_buffer_data
 
         self.observations = _cat_list(self.observations, observations, self.max_size)
         self.actions = _cat_list(self.actions, actions, self.max_size)
@@ -121,6 +124,8 @@ class ExperienceBuffer(Generic[AgentID, ObsType, ActionType, RewardType]):
             advantages,
             self.max_size,
         )
+
+        return trajectory_processor_data
 
     def _get_samples(self, indices) -> Tuple[
         List[ActionType],

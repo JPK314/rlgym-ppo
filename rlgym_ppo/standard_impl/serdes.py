@@ -1,5 +1,5 @@
 import struct
-from typing import Iterable, Tuple, Type
+from typing import Generic, Iterable, List, Tuple, Type, TypeVar, Union
 
 import numpy as np
 from rlgym.api import RewardType
@@ -32,12 +32,12 @@ class NumpyDynamicShapeSerde(TypeSerde[np.ndarray]):
         Function to convert bytes to T, for passing between batched agent and the agent manager.
         :return: T obj such that from_bytes(to_bytes(obj)) == obj.
         """
-        end = INTEGER_SIZE
-        shape_len = struct.unpack("=I", byts[:end])[0]
-        start = end
-        end = start + shape_len * INTEGER_SIZE
-        shape = struct.unpack(f"={shape_len}I", byts[start:end])
-        start = end
+        stop = INTEGER_SIZE
+        shape_len = struct.unpack("=I", byts[:stop])[0]
+        start = stop
+        stop = start + shape_len * INTEGER_SIZE
+        shape = struct.unpack(f"={shape_len}I", byts[start:stop])
+        start = stop
         return np.frombuffer(byts[start:], dtype=self.dtype).reshape(shape)
 
 
@@ -117,7 +117,7 @@ STR_TYPE_CODE = 2
 BOOL_TYPE_CODE = 3
 
 
-class DynamicPrimitiveTupleSerde(TypeSerde[Tuple]):
+class DynamicPrimitiveTupleSerde(TypeSerde[Tuple[Union[int, float, str, bool], ...]]):
     def to_bytes(self, obj):
         byts = bytes()
         byts += struct.pack("=I", len(obj))
@@ -139,34 +139,34 @@ class DynamicPrimitiveTupleSerde(TypeSerde[Tuple]):
 
     def from_bytes(self, byts) -> Tuple:
         start = 0
-        end = INTEGER_SIZE
-        tup_len = struct.unpack("=I", byts[start:end])[0]
-        start = end
+        stop = INTEGER_SIZE
+        tup_len = struct.unpack("=I", byts[start:stop])[0]
+        start = stop
         items = []
         for _ in range(tup_len):
-            end = start + INTEGER_SIZE
-            type_code = struct.unpack("=i", byts[start:end])[0]
-            start = end
+            stop = start + INTEGER_SIZE
+            type_code = struct.unpack("=i", byts[start:stop])[0]
+            start = stop
             if type_code == INT_TYPE_CODE:
-                end = start + INTEGER_SIZE
-                item = struct.unpack("=i", byts[start:end])[0]
-                start = end
+                stop = start + INTEGER_SIZE
+                item = struct.unpack("=i", byts[start:stop])[0]
+                start = stop
             elif type_code == FLOAT_TYPE_CODE:
-                end = start + FLOAT_SIZE
-                item = struct.unpack("=f", byts[start:end])[0]
-                start = end
+                stop = start + FLOAT_SIZE
+                item = struct.unpack("=f", byts[start:stop])[0]
+                start = stop
             elif type_code == STR_TYPE_CODE:
-                end = start + INTEGER_SIZE
-                str_bytes_len = struct.unpack("=I", byts[start:end])[0]
-                start = end
-                end = start + str_bytes_len
-                item = byts[start:end].decode()
-                start = end
+                stop = start + INTEGER_SIZE
+                str_bytes_len = struct.unpack("=I", byts[start:stop])[0]
+                start = stop
+                stop = start + str_bytes_len
+                item = byts[start:stop].decode()
+                start = stop
             elif type_code == BOOL_TYPE_CODE:
-                end = start + BOOL_SIZE
-                item = struct.unpack("=?", byts[start:end])[0]
-                start = end
-            items.append(item)
+                stop = start + BOOL_SIZE
+                item = struct.unpack("=?", byts[start:stop])[0]
+                start = stop
+            items.appstop(item)
         return tuple(items)
 
 
@@ -182,12 +182,46 @@ class StrIntTupleSerde(TypeSerde[Tuple[str, int]]):
 
     def from_bytes(self, byts):
         start = 0
-        end = INTEGER_SIZE
-        str_bytes_len = struct.unpack("=I", byts[start:end])[0]
-        start = end
-        end = start + str_bytes_len
-        str_item = byts[start:end].decode()
-        start = end
-        end = start + INTEGER_SIZE
-        int_item = struct.unpack("=i", byts[start:end])[0]
+        stop = INTEGER_SIZE
+        str_bytes_len = struct.unpack("=I", byts[start:stop])[0]
+        start = stop
+        stop = start + str_bytes_len
+        str_item = byts[start:stop].decode()
+        start = stop
+        stop = start + INTEGER_SIZE
+        int_item = struct.unpack("=i", byts[start:stop])[0]
         return (str_item, int_item)
+
+
+T = TypeVar("T")
+
+
+class HomogeneousTupleSerde(Generic[T], TypeSerde[Tuple[T, ...]]):
+    def __init__(self, t_serde: TypeSerde[T]):
+        self.t_serde = t_serde
+
+    def to_bytes(self, obj) -> bytes:
+        byts = bytes()
+        byts += struct.pack("=I", len(obj))
+        for t in obj:
+            t_bytes = self.t_serde.to_bytes(t)
+            byts += struct.pack("=I", len(t_bytes))
+            byts += t_bytes
+        return byts
+
+    def from_bytes(self, byts: bytes) -> Tuple[T, ...]:
+        start = 0
+        stop = INTEGER_SIZE
+        tup_len = struct.unpack("=I", byts[start:stop])[0]
+        start = stop
+        obj: List[T] = []
+        for _ in range(tup_len):
+            stop = start + INTEGER_SIZE
+            t_bytes_len = struct.unpack("=I", byts[start:stop])[0]
+            start = stop
+            stop = start + t_bytes_len
+            t = self.t_serde.from_bytes(byts[start:stop])
+            obj.append(t)
+            start = stop
+
+        return tuple(obj)
